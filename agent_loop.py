@@ -129,6 +129,8 @@ def run_one_turn(state:LoopState):
         state.transition_reason=None
         return False
     #4. 如果有参数调用列表，获取该列表进行处理
+    if ai_message.tool_calls:
+        print(f"检测到{len(ai_message.tool_calls)}个工具调用，准备执行...")
     results=execute_tool_calls(ai_message.tool_calls)
 
     if not results:
@@ -146,6 +148,7 @@ def agent_loop(state: LoopState) -> None:
 if __name__ == "__main__":
     #agent loop
     history = []
+    history.append({"role":"system","content":SYSTEM})
     while True:
         try:
             query = input("\033[36ms01 >> \033[0m")
@@ -153,7 +156,6 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
-        history.append({"role":"system","content":SYSTEM})
         history.append({"role": "user", "content": query})
         state = LoopState(message=history)
         agent_loop(state)

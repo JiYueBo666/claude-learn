@@ -1,31 +1,72 @@
+import json
 import os
 import subprocess
 from dataclasses import dataclass
-
+from pathlib import Path
 from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 
-def Loger(msg:str):
+
+def Loger(msg: str):
     print(msg)
 
 
-api_key=os.environ['API_KEY']
-base_url=os.environ['BASE_URL']
-model_id=os.environ['MODEL']
+api_key = os.environ["API_KEY"]
+base_url = os.environ["BASE_URL"]
+model_id = os.environ["MODEL"]
 
-Loger(f'api key :{api_key}')
+client = OpenAI(base_url=base_url, api_key=api_key)
+WORKDIR = Path.cwd()
+SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
 
-client=OpenAI(
-    base_url=base_url,
-    api_key=api_key
-)
 
-SYSTEM=(
-    f'you are a coding agent at {os.getcwd()}'
-    "use bash to inspect and change workspace.Act first,than report clearly"
-)
+# =======================================================================================
+def safe_path(p: str):
+    path = (WORKDIR / p).resolve()
+    if not path.is_relative_to(WORKDIR):
+        raise ValueError(f"path escapes workspace:{p}")
+    return path
+
+
+def run_read(path: str, limit: int = None):
+    text = safe_path(path).read_text()
+    lines = text.splitlines()
+    if limit and limit < len(lines):
+        lines = lines[:limit]
+    return "\n".join(lines)[:50000]
+
+
+def run_write(path: str, content: str) -> str:
+    try:
+        fp = safe_path(path)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(content)
+        return f"Wrote {len(content)} bytes to {path}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def run_edit(path: str, old_text: str, new_text: str) -> str:
+    try:
+        fp = safe_path(path)
+        content = fp.read_text()
+        if old_text not in content:
+            return f"Error: Text not found in {path}"
+        fp.write_text(content.replace(old_text, new_text, 1))
+        return f"Edited {path}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+TOOL_HANDERS = {
+    "bash": lambda **kw: run_bash(kw["command"]),
+    "read_file": lambda **kw: run_read(kw["path"], kw["limit"]),
+    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
+    "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+}
+
 TOOLS = [
     {
         "type": "function",
@@ -37,130 +78,140 @@ TOOLS = [
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "Shell command to execute"
+                        "description": "Shell command to execute",
                     }
                 },
-                "required": ["command"]
-            }
-        }
-    }
+                "required": ["command"],  # 正确位置
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a file in current workspace",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to read"},
+                    "limit": {
+                        "type": "integer",
+                        "description": "Limit the number of lines to read",
+                    },
+                },
+                "required": ["path", "limit"],  # ✅ 修复：和 properties 平级
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write a file in current workspace",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to write"},
+                    "content": {"type": "string", "description": "Content to write"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Edit a file in current workspace",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to edit"},
+                    "old_text": {"type": "string", "description": "Text to replace"},
+                    "new_text": {
+                        "type": "string",
+                        "description": "Text to replace with",
+                    },
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+        },
+    },
 ]
-@dataclass
-class LoopState:
-    message:list
-    turn_count:int=1
-    transition_reason:str|None=None
 
-def run_bash(command:str):
-    dangerous=["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
+
+def run_bash(command: str):
+    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(item in command for item in dangerous):
-        return 'Error:Dangerous command blocks'
-    
+        return "Error:Dangerous command blocks"
+
     try:
-        result=subprocess.run(
+        result = subprocess.run(
             command,
             shell=True,
             cwd=os.getcwd(),
             capture_output=True,
             text=True,
-            timeout=120
+            timeout=120,
         )
     except subprocess.TimeoutExpired:
-        return 'Error: Time out (120s)'
-    except (FileNotFoundError,OSError) as e:
-        return f'Error: {e}'
-    
-    output=(result.stdout+result.stderr).strip()
+        return "Error: Time out (120s)"
+    except (FileNotFoundError, OSError) as e:
+        return f"Error: {e}"
+
+    output = (result.stdout + result.stderr).strip()
     return output[:50000] if output else "(no output)"
 
-def extract_text(content) -> str:
-    if not isinstance(content, list):
-        return ""
-    texts = []
-    for block in content:
-        text = getattr(block, "text", None)
-        if text:
-            texts.append(text)
-    return "\n".join(texts).strip()
 
-def execute_tool_calls(tool_calls):
-    print("执行工具调用")
-    results=[]
-    #列表中是一系列要调用的函数
-    #遍历调用列表，获取函数，函数名，函数参数
-    for tool_call in tool_calls:
-        func=tool_call.function
-        func_name=func.name
-        #函数参数json，字符串格式,转为字典
-        args=eval(func.arguments)
+def agent_loop(messages) -> None:
+    while True:
+        response = client.chat.completions.create(
+            model=model_id,
+            messages=messages,
+            tool_choice="auto",
+            tools=TOOLS,
+            max_tokens=8000,
+        )
+        messages.append(response.choices[0].message.model_dump())
+        # 3.从返回内容中，寻找是否参数调用
+        if response.choices[0].finish_reason != "tool_calls":
+            return
+        results = []
+        tool_calls = response.choices[0].message.tool_calls
+        if tool_calls:
+            for tool_call in tool_calls:
+                tool_name = tool_call.function.name
+                args = json.loads(tool_call.function.arguments)
 
-        if func_name=='bash':
-            #取参数字段
-            command=args['command']
-            print(f"\033[33m$ {command}\033[0m")
-            output = run_bash(command)
-            print(output[:200])
+                handler = TOOL_HANDERS.get(tool_name)
+                output = handler(**args) if handler else f"Unknow tool :{tool_name}"
+                print(f"> {tool_name}:")
+                print(output[:200])
+                results.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": tool_name,
+                        "content": output,
+                    }
+                )
+        messages.extend(results)
 
-            # OpenAI 格式返回 tool 消息
-            results.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": output
-            })
-    return results
-
-
-def run_one_turn(state:LoopState):
-    #1.定义服务端，传入工具列表和历史消息
-    response=client.chat.completions.create(
-        model=model_id,
-        messages=state.message,
-        tool_choice='auto',
-        tools=TOOLS,
-        max_tokens=8000
-    )
-    #.2.获取返回内容，解析choices[0].message字段，存入历史
-    choice=response.choices[0]
-    ai_message=choice.message
-    state.message.append(ai_message.model_dump())
-
-    #3.从返回内容中，寻找是否参数调用
-    if choice.finish_reason!='tool_calls':
-        state.transition_reason=None
-        return False
-    #4. 如果有参数调用列表，获取该列表进行处理
-    if ai_message.tool_calls:
-        print(f"检测到{len(ai_message.tool_calls)}个工具调用，准备执行...")
-    results=execute_tool_calls(ai_message.tool_calls)
-
-    if not results:
-        state.transition_reason=None
-        return False
-    state.message.extend(results)
-    state.turn_count+=1
-    state.transition_reason='tool_result'
-    return True
-
-def agent_loop(state: LoopState) -> None:
-    while run_one_turn(state):
-        pass
 
 if __name__ == "__main__":
-    #agent loop
     history = []
-    history.append({"role":"system","content":SYSTEM})
     while True:
         try:
-            query = input("\033[36ms01 >> \033[0m")
+            query = input("\033[36ms02 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
         history.append({"role": "user", "content": query})
-        state = LoopState(message=history)
-        agent_loop(state)
-
-        final_text = extract_text(history[-1]["content"])
-        if final_text:
-            print(final_text)
+        agent_loop(history)
+        response_content = history[-1]["content"]
+        if isinstance(response_content, list):
+            for block in response_content:
+                if hasattr(block, "text"):
+                    print(block.text)
         print()

@@ -19,10 +19,11 @@ model_id = os.environ["MODEL"]
 
 client = OpenAI(base_url=base_url, api_key=api_key)
 WORKDIR = Path.cwd()
-SYSTEM = f"""You are a coding agent at {WORKDIR}.
-Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
-Prefer tools over prose."""
-
+SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
+SUBAGENT_SYSTEM = (
+    f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
+    ""
+)
 
 # =======================================================================================
 
@@ -106,6 +107,73 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
+def run_bash(command: str):
+    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
+    if any(item in command for item in dangerous):
+        return "Error:Dangerous command blocks"
+
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            cwd=os.getcwd(),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return "Error: Time out (120s)"
+    except (FileNotFoundError, OSError) as e:
+        return f"Error: {e}"
+
+    output = (result.stdout + result.stderr).strip()
+    return output[:50000] if output else "(no output)"
+
+
+def run_subagent(prompt: str):
+    sub_messages = [{"role": "user", "content": prompt}]
+    for _ in range(30):
+        response = client.chat.completions.create(
+            model=model_id,
+            messages=sub_messages,
+            tool_choice="auto",
+            tools=CHILD_TOOLS,
+            max_tokens=8000,
+        )
+
+        sub_messages.append(
+            {"role": "assistant", "content": response.choices[0].message.content}
+        )
+
+        if response.choices[0].finish_reason != "stop":
+            break
+        results = []
+        tool_calls = response.choices[0].message.tool_calls
+        for tool_call in tool_calls:
+            tool_name = tool_call.function.name
+            args = tool_call.function.arguments
+            args = json.loads(args)
+            handler = TOOL_HANDERS.get(tool_name)
+            try:
+                output = handler(**args) if handler else f"Unknow tool: {tool_name}"
+            except Exception as e:
+                output = f"Error: {e}"
+            results.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "name": tool_name,
+                    "content": output,
+                }
+            )
+        sub_messages.extend(results)
+    final_content = response.choices[0].message.content
+
+    return final_content.strip() if final_content.strip() else "(no output)"
+
+
+# +++++++++++++++++++++++++++++++工具定义+++++++++++++++++++++++++++++++++++++++++++++++++++++
+
 TOOL_HANDERS = {
     "bash": lambda **kw: run_bash(kw["command"]),
     "read_file": lambda **kw: run_read(kw["path"], kw["limit"]),
@@ -114,7 +182,7 @@ TOOL_HANDERS = {
     "todo": lambda **kw: TODO.update(kw["items"]),
 }
 
-TOOLS = [
+CHILD_TOOLS = [
     {
         "type": "function",
         "function": {
@@ -222,28 +290,30 @@ TOOLS = [
     },
 ]
 
-
-def run_bash(command: str):
-    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-    if any(item in command for item in dangerous):
-        return "Error:Dangerous command blocks"
-
-    try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            cwd=os.getcwd(),
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-    except subprocess.TimeoutExpired:
-        return "Error: Time out (120s)"
-    except (FileNotFoundError, OSError) as e:
-        return f"Error: {e}"
-
-    output = (result.stdout + result.stderr).strip()
-    return output[:50000] if output else "(no output)"
+# -- Parent tools: base tools + task dispatcher --
+PARENT_TOOLS = CHILD_TOOLS + [
+    {
+        "type": "function",
+        "function": {
+            "name": "task",
+            "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "The main prompt/instruction for the subagent to execute",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Short description of the task",
+                    },
+                },
+                "required": ["prompt"],
+            },
+        },
+    }
+]
 
 
 def agent_loop(messages) -> None:
@@ -253,7 +323,7 @@ def agent_loop(messages) -> None:
             model=model_id,
             messages=messages,
             tool_choice="auto",
-            tools=TOOLS,
+            tools=PARENT_TOOLS,
             max_tokens=8000,
         )
         messages.append(response.choices[0].message.model_dump())
@@ -269,17 +339,24 @@ def agent_loop(messages) -> None:
         if tool_calls:
             for tool_call in tool_calls:
                 tool_name = tool_call.function.name
-                args = json.loads(tool_call.function.arguments)
-                handler = TOOL_HANDERS.get(tool_name)
-                print(f"工具调用: {tool_name}")
-                try:
-                    output = handler(**args) if handler else f"Unknow tool :{tool_name}"
-                except Exception as e:
-                    output = f"Error: {e}"
+                if tool_name == "task":
+                    args = json.loads(tool_call.function.arguments)
+                    desc = args.get("description", "")
+                    prompt = args.get("prompt", "")
+                    print(f">task: {desc} : prompt: {prompt}")
+                    output = run_subagent(prompt)
+                else:
+                    args = json.loads(tool_call.function.arguments)
+                    handler = TOOL_HANDERS.get(tool_name)
+                    print(f"工具调用: {tool_name}")
+                    try:
+                        output = (
+                            handler(**args) if handler else f"Unknow tool :{tool_name}"
+                        )
+                    except Exception as e:
+                        output = f"Error: {e}"
 
-                print(f"> {tool_name}:")
                 print(output[:200])
-
                 results.append(
                     {
                         "role": "tool",
@@ -291,11 +368,11 @@ def agent_loop(messages) -> None:
                 if tool_name == "todo":
                     used_todo = True
         # 三轮没有规划任务强制提醒
-        rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
-        if rounds_since_todo > 3:
-            results.append(
-                {"role": "user", "content": "<reminder>Update your todos. </reminder>"}
-            )
+        # rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
+        # if rounds_since_todo > 3:
+        #     results.append(
+        #         {"role": "user", "content": "<reminder>Update your todos. </reminder>"}
+        #     )
         messages.extend(results)
 
 

@@ -19,10 +19,56 @@ model_id = os.environ["MODEL"]
 
 client = OpenAI(base_url=base_url, api_key=api_key)
 WORKDIR = Path.cwd()
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
+SYSTEM = f"""You are a coding agent at {WORKDIR}.
+Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
+Prefer tools over prose."""
 
 
 # =======================================================================================
+
+
+class TodoManager:
+    def __init__(self):
+        self.items = []
+
+    def update(self, items):
+        if len(items) > 20:
+            raise ValueError("Max 20 dotos allowed")
+        validated = []
+        in_progress_count = 0
+        for i, item in enumerate(items):
+            text = str(item.get("text", "")).strip()
+            status = str(item.get("status", "")).strip()
+            item_id = str(item.get("id", "")).strip()
+            if not text:
+                raise ValueError(f"Todo {i} text required")
+            if not status:
+                raise ValueError(f"Todo {i} status required")
+            if status == "in_progress":
+                in_progress_count += 1
+            validated.append({"id": item_id, "text": text, "status": status})
+        if in_progress_count > 1:
+            raise ValueError("Only one todo can be in_progress")
+        self.items = validated
+        return self.render()
+
+    def render(self):
+        if not self.items:
+            return "No todos"
+        lines = []
+        for item in self.items:
+            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}[
+                item["status"]
+            ]
+            lines.append(f"{marker} #{item['id']} {item['text']}")
+        done = sum(1 for t in self.items if t["status"] == "completed")
+        lines.append(f"\n({done}/{len(self.items)} completed)")
+        return "\n".join(lines)
+
+
+TODO = TodoManager()
+
+
 def safe_path(p: str):
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -65,6 +111,7 @@ TOOL_HANDERS = {
     "read_file": lambda **kw: run_read(kw["path"], kw["limit"]),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "todo": lambda **kw: TODO.update(kw["items"]),
 }
 
 TOOLS = [
@@ -137,6 +184,42 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "todo",
+            "description": "Update task list. Track progress on multi-step tasks.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "description": "待办事项数组",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "description": "待办事项唯一ID",
+                                },
+                                "text": {
+                                    "type": "string",
+                                    "description": "待办内容文本",
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"],
+                                    "description": "待办状态：待处理/进行中/已完成",
+                                },
+                            },
+                            "required": ["id", "text", "status"],
+                        },
+                    }
+                },
+                "required": ["items"],
+            },
+        },
+    },
 ]
 
 
@@ -164,6 +247,7 @@ def run_bash(command: str):
 
 
 def agent_loop(messages) -> None:
+    rounds_since_todo = 0
     while True:
         response = client.chat.completions.create(
             model=model_id,
@@ -173,20 +257,29 @@ def agent_loop(messages) -> None:
             max_tokens=8000,
         )
         messages.append(response.choices[0].message.model_dump())
+
+        print(f"> Assistant: {response.choices[0].message.content}")
+        print(f"++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
         # 3.从返回内容中，寻找是否参数调用
         if response.choices[0].finish_reason != "tool_calls":
             return
         results = []
+        used_todo = False
         tool_calls = response.choices[0].message.tool_calls
         if tool_calls:
             for tool_call in tool_calls:
                 tool_name = tool_call.function.name
                 args = json.loads(tool_call.function.arguments)
-
                 handler = TOOL_HANDERS.get(tool_name)
-                output = handler(**args) if handler else f"Unknow tool :{tool_name}"
+                print(f"工具调用: {tool_name}")
+                try:
+                    output = handler(**args) if handler else f"Unknow tool :{tool_name}"
+                except Exception as e:
+                    output = f"Error: {e}"
+
                 print(f"> {tool_name}:")
                 print(output[:200])
+
                 results.append(
                     {
                         "role": "tool",
@@ -195,6 +288,14 @@ def agent_loop(messages) -> None:
                         "content": output,
                     }
                 )
+                if tool_name == "todo":
+                    used_todo = True
+        # 三轮没有规划任务强制提醒
+        rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
+        if rounds_since_todo > 3:
+            results.append(
+                {"role": "user", "content": "<reminder>Update your todos. </reminder>"}
+            )
         messages.extend(results)
 
 

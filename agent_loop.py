@@ -7,7 +7,7 @@ from pathlib import Path
 from openai import OpenAI
 from dotenv import load_dotenv
 import yaml
-
+import time
 
 load_dotenv()
 
@@ -22,8 +22,111 @@ model_id = os.environ["MODEL"]
 
 client = OpenAI(base_url=base_url, api_key=api_key)
 WORKDIR = Path.cwd()
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
+# SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
 SKILLS_DIR = WORKDIR / "skills"
+
+THRESHOLD = 50000
+KEEP_RECENT = 3
+TRANSCRIPT_DIR = WORKDIR / ".transcripts"
+PRESERVE_RESULT_TOOLS = {"read_file"}
+
+
+def estimate_tokens(messages: list):
+    return len(str(messages)) // 4
+
+
+def micro_compact(messages: list):
+    """
+    OpenAI 格式对话消息精简：
+    自动压缩旧的 tool call 结果，只保留最近 KEEP_RECENT 条完整内容
+    兼容 OpenAI Chat Completions tools / function calling 格式
+    """
+    # 1. 收集所有 tool_result（OpenAI  role=tool 的消息）
+    tool_results = []
+    for msg_idx, msg in enumerate(messages):
+        # OpenAI 官方：工具返回用 role="tool"
+        if msg.get("role") == "tool":
+            tool_results.append((msg_idx, msg))
+
+    # 如果工具结果太少，不精简
+    if len(tool_results) < KEEP_RECENT:
+        return messages
+
+    # 2. 建立 tool_call_id -> function name 映射（从 assistant 调用记录）
+    tool_name_map = {}
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            tool_calls = msg.get("tool_calls", [])
+            if not tool_calls:
+                continue
+            for call in tool_calls:
+                tool_id = call.get("id")
+                tool_name = call.get("function", {}).get("name")
+                if tool_id and tool_name:
+                    tool_name_map[tool_id] = tool_name
+
+    # 3. 只保留最近 KEEP_RECENT 条，更早的需要精简
+    to_clear = tool_results[:-KEEP_RECENT]
+
+    # 4. 精简旧的工具结果
+    for msg_idx, result_msg in to_clear:
+        content = result_msg.get("content", "")
+        tool_call_id = result_msg.get("tool_call_id", "")
+
+        # 过滤：短内容不精简
+        if not isinstance(content, str) or len(content) < 100:
+            continue
+
+        # 获取工具名
+        tool_name = tool_name_map.get(tool_call_id, "unknown_tool")
+
+        # 白名单工具不精简
+        if tool_name in PRESERVE_RESULT_TOOLS:
+            continue
+
+        # 替换为精简提示（OpenAI 格式直接改 content 即可）
+        result_msg["content"] = f"[Previous result: {tool_name} called]"
+
+    return messages
+
+
+def auto_compact(messages: list):
+    TRANSCRIPT_DIR.mkdir(exist_ok=True)
+    transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
+    # 历史写入文件
+    with open(transcript_path, "w", encoding="utf-8") as f:
+        for msg in messages:
+            f.write(json.dumps(msg, ensure_ascii=False, default=str) + "\n")
+    print(f"[transcript saved: {transcript_path}]")
+
+    conversation_text = json.dumps(messages, ensure_ascii=False, default=str)[-80000:]
+    response = client.chat.completions.create(
+        model=model_id,
+        messages=[
+            {
+                "role": "user",
+                "content": "Summarize this conversation for continuity. Include:\n"
+                "1) What was accomplished\n"
+                "2) Current state\n"
+                "3) Key decisions made\n"
+                "Be concise but keep critical details.\n\n"
+                f"Conversation:\n{conversation_text}",
+            }
+        ],
+        max_tokens=2000,
+        temperature=0.1,  # 让总结更稳定
+    )
+    summary = response.choices[0].message.content.strip()
+    if not summary:
+        summary = "No summary generated."
+
+    # ========== 5. 返回 OpenAI 格式的单条压缩消息 ==========
+    return [
+        {
+            "role": "user",
+            "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}",
+        }
+    ]
 
 
 # ================================
@@ -245,9 +348,27 @@ TOOL_HANDERS = {
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
     "todo": lambda **kw: TODO.update(kw["items"]),
     "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
+    "compact": lambda **kw: "Manual compression requested.",
 }
 
 CHILD_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "compact",
+            "description": "Trigger manual conversation compression.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "focus": {
+                        "type": "string",
+                        "description": "What content or information to preserve in the summary",
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -396,8 +517,12 @@ PARENT_TOOLS = CHILD_TOOLS + [
 
 
 def agent_loop(messages) -> None:
-    rounds_since_todo = 0
     while True:
+        micro_compact(messages)
+        if estimate_tokens(messages) > THRESHOLD:
+            print("auto compact triggered")
+            messages[:] = auto_compact(messages)
+
         response = client.chat.completions.create(
             model=model_id,
             messages=messages,
@@ -413,7 +538,7 @@ def agent_loop(messages) -> None:
         if response.choices[0].finish_reason != "tool_calls":
             return
         results = []
-        used_todo = False
+        manual_compact = False
         tool_calls = response.choices[0].message.tool_calls
         if tool_calls:
             for tool_call in tool_calls:
@@ -424,6 +549,9 @@ def agent_loop(messages) -> None:
                     prompt = args.get("prompt", "")
                     print(f">task: {desc} : prompt: {prompt}")
                     output = run_subagent(prompt)
+                elif tool_name == "compact":
+                    manual_compact = True
+                    output = "Compressing"
                 else:
                     args = json.loads(tool_call.function.arguments)
                     handler = TOOL_HANDERS.get(tool_name)
@@ -453,6 +581,10 @@ def agent_loop(messages) -> None:
         #         {"role": "user", "content": "<reminder>Update your todos. </reminder>"}
         #     )
         messages.extend(results)
+        if manual_compact:
+            print("[manual compact]")
+            messages[:] = auto_compact(messages)
+            return
 
 
 if __name__ == "__main__":

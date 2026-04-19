@@ -1,10 +1,13 @@
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from openai import OpenAI
 from dotenv import load_dotenv
+import yaml
+
 
 load_dotenv()
 
@@ -20,10 +23,71 @@ model_id = os.environ["MODEL"]
 client = OpenAI(base_url=base_url, api_key=api_key)
 WORKDIR = Path.cwd()
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
-SUBAGENT_SYSTEM = (
-    f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
-    ""
-)
+SKILLS_DIR = WORKDIR / "skills"
+
+
+# ================================
+class SkillLoader:
+    def __init__(self, skill_dir: Path):
+        self.skill_dir = skill_dir
+        self.skills = {}
+        self._load_all()
+
+    def _load_all(self):
+        if not self.skill_dir.exists():
+            return
+        for f in sorted(self.skill_dir.rglob("SKILL.md")):
+            text = f.read_text()
+            meta, body = self._parse_frontmatter(text)
+            name = meta.get("name", f.parent.name)
+            self.skills[name] = {"meta": meta, "body": body, "path": str(f)}
+
+    def _parse_frontmatter(self, text):
+        match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
+
+        if not match:
+            return {}, text
+
+        try:
+            meta = yaml.safe_load(match.group(1)) or {}
+        except yaml.YAMLError:
+            meta = {}
+
+        return meta, match.group(2).strip()
+
+    def get_descriptions(self):
+        """
+        short description for the system prompt
+        """
+        if not self.skills:
+            return "(no skills available)"
+        lines = []
+        for name, skill in self.skills.items():
+            desc = skill["meta"].get("description", "No description")
+            tags = skill["meta"].get("tags", "")
+            line = f"  - {name}: {desc}"
+            if tags:
+                line += f" [{tags}]"
+            lines.append(line)
+        return "\n".join(lines)
+
+    def get_content(self, name: str) -> str:
+        """Layer 2: full skill body returned in tool_result."""
+        skill = self.skills.get(name)
+        if not skill:
+            return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
+        return f"<skill name=\"{name}\">\n{skill['body']}\n</skill>"
+
+
+SKILL_LOADER = SkillLoader(SKILLS_DIR)
+
+
+# Layer 1: skill metadata injected into system prompt
+SYSTEM = f"""You are a coding agent at {WORKDIR}.
+Use load_skill to access specialized knowledge before tackling unfamiliar topics.
+
+Skills available:
+{SKILL_LOADER.get_descriptions()}"""
 
 # =======================================================================================
 
@@ -180,9 +244,24 @@ TOOL_HANDERS = {
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
     "todo": lambda **kw: TODO.update(kw["items"]),
+    "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
 }
 
 CHILD_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "load_skill",
+            "description": "Load specialized knowledge by name.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Skill name to load"}
+                },
+                "required": ["name"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {

@@ -32,8 +32,19 @@ KEEP_RECENT = 3
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 PRESERVE_RESULT_TOOLS = {"read_file"}
 TASKS_DIR = WORKDIR / ".tasks"
+TEAM_DIR = WORKDIR / ".teams"
+INBOX_DIR = TEAM_DIR / "inbox"
+SYSTEM = (
+    f"You are a team lead at {WORKDIR}. Spawn teammates and communicate via inboxes."
+)
 
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use background_run for long-running commands."
+VALID_MSG_TYPES = {
+    "message",
+    "broadcast",
+    "shotdown_request",
+    "shutdown_response",
+    "plan_approval_response",
+}
 
 
 def estimate_tokens(messages: list):
@@ -289,6 +300,264 @@ TASKS = TaskManager(TASKS_DIR)
 # =================================================================================
 
 
+class MessageBus:
+    def __init__(self, inbox_dir: Path):
+        self.dir = inbox_dir
+        self.dir.mkdir(parents=True, exist_ok=True)
+
+    def send(
+        self,
+        sender: str,
+        to: str,
+        content: str,
+        msg_type: str = "message",
+        extra: dict = None,
+    ):
+        if msg_type not in VALID_MSG_TYPES:
+            return f"Error: Invalid type '{msg_type}'. Valid: {VALID_MSG_TYPES}"
+        msg = {
+            "type": msg_type,
+            "from": sender,
+            "content": content,
+            "timestamp": time.time(),
+        }
+        if extra:
+            msg.update(extra)
+        inbox_path = self.dir / f"{to}.jsonl"
+        with open(inbox_path, "a") as f:
+            f.write(json.dumps(msg) + "\n")
+        return f"Sent {msg_type} to {to}"
+
+    def read_inbox(self, name: str) -> list:
+        inbox_path = self.dir / f"{name}.jsonl"
+        if not inbox_path.exists():
+            return []
+        messages = []
+        for line in inbox_path.read_text().strip().splitlines():
+            if line:
+                messages.append(json.loads(line))
+        inbox_path.write_text("")
+        return messages
+
+    def broadcast(self, sender: str, content: str, teammates: list) -> str:
+        count = 0
+        for name in teammates:
+            if name != sender:
+                self.send(sender, name, content, "broadcast")
+                count += 1
+        return f"Broadcast to {count} teammates"
+
+
+BUS = MessageBus(INBOX_DIR)
+
+
+# =====================================================================================
+class TeammateManager:
+    def __init__(self, team_dir: Path):
+        self.dir = team_dir
+        self.dir.mkdir(exist_ok=True)
+        self.config_path = self.dir / "config.json"
+        self.config = self._load_config()
+        self.threads = {}
+
+    def _load_config(self) -> dict:
+        if self.config_path.exists():
+            return json.loads(self.config_path.read_text())
+        return {"team_name": "default", "members": []}
+
+    def _save_config(self):
+        self.config_path.write_text(json.dumps(self.config, indent=2))
+
+    def _find_member(self, name: str) -> dict:
+        for m in self.config["members"]:
+            if m["name"] == name:
+                return m
+        return None
+
+    def spawn(self, name: str, role: str, prompt: str) -> str:
+        member = self._find_member(name)
+        if member:
+            if member["status"] not in ("idle", "shutdown"):
+                return f"Error: '{name}' is currently {member['status']}"
+            member["status"] = "working"
+            member["role"] = role
+        else:
+            member = {"name": name, "role": role, "status": "working"}
+            self.config["members"].append(member)
+        self._save_config()
+        thread = threading.Thread(
+            target=self._teammate_loop,
+            args=(name, role, prompt),
+            daemon=True,
+        )
+        self.threads[name] = thread
+        thread.start()
+        return f"Spawned '{name}' (role: {role})"
+
+    def _teammate_loop(self, name: str, role: str, prompt: str):
+        sys_prompt = (
+            f"You are '{name}', role: {role}, at {WORKDIR}. "
+            f"Use send_message to communicate. Complete your task."
+        )
+        messages = [{"role": "user", "content": prompt}]
+        tools = self._teammate_tools()  # 你已经是 OpenAI 格式的工具定义
+
+        for _ in range(50):
+            # 读取消息
+            inbox = BUS.read_inbox(name)
+            for msg in inbox:
+                messages.append(
+                    {"role": "user", "content": json.dumps(msg, ensure_ascii=False)}
+                )
+
+            try:
+                # ✅ OpenAI 标准格式调用
+                response = client.chat.completions.create(
+                    model=model_id,
+                    messages=[{"role": "system", "content": sys_prompt}, *messages],
+                    tools=tools,
+                    max_tokens=8000,
+                )
+            except Exception:
+                break
+
+            # 获取助手回复
+            response_msg = response.choices[0].message
+            messages.append(response_msg)
+
+            # 判断是否停止（不是工具调用就退出）
+            if response_msg.tool_calls is None:
+                break
+
+            results = []
+            # ✅ OpenAI 格式：tool_calls 遍历
+            if response_msg.tool_calls:
+                for tool_call in response_msg.tool_calls:
+                    tool_name = tool_call.function.name
+                    tool_args = json.loads(tool_call.function.arguments)
+
+                    # 执行工具
+                    output = self._exec(name, tool_name, tool_args)
+                    print(f"  [{name}] {tool_name}: {str(output)[:120]}")
+
+                    # 组装 tool_result（OpenAI 格式）
+                    results.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": str(output),
+                        }
+                    )
+
+            # 把工具结果加入对话
+            messages.extend(results)
+
+        # 成员状态改为空闲
+        member = self._find_member(name)
+        if member and member["status"] != "shutdown":
+            member["status"] = "idle"
+            self._save_config()
+
+    def _exec(self, sender: str, tool_name: str, args: dict) -> str:
+        # these base tools are unchanged from s02
+        if tool_name == "bash":
+            return _run_bash(args["command"])
+        if tool_name == "read_file":
+            return _run_read(args["path"])
+        if tool_name == "write_file":
+            return _run_write(args["path"], args["content"])
+        if tool_name == "edit_file":
+            return _run_edit(args["path"], args["old_text"], args["new_text"])
+        if tool_name == "send_message":
+            return BUS.send(
+                sender, args["to"], args["content"], args.get("msg_type", "message")
+            )
+        if tool_name == "read_inbox":
+            return json.dumps(BUS.read_inbox(sender), indent=2)
+        return f"Unknown tool: {tool_name}"
+
+    def _teammate_tools(self) -> list:
+        # these base tools are unchanged from s02
+        return [
+            {
+                "name": "bash",
+                "description": "Run a shell command.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+            {
+                "name": "read_file",
+                "description": "Read file contents.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            },
+            {
+                "name": "write_file",
+                "description": "Write content to file.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["path", "content"],
+                },
+            },
+            {
+                "name": "edit_file",
+                "description": "Replace exact text in file.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "old_text": {"type": "string"},
+                        "new_text": {"type": "string"},
+                    },
+                    "required": ["path", "old_text", "new_text"],
+                },
+            },
+            {
+                "name": "send_message",
+                "description": "Send message to a teammate.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "to": {"type": "string"},
+                        "content": {"type": "string"},
+                        "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)},
+                    },
+                    "required": ["to", "content"],
+                },
+            },
+            {
+                "name": "read_inbox",
+                "description": "Read and drain your inbox.",
+                "input_schema": {"type": "object", "properties": {}},
+            },
+        ]
+
+    def list_all(self) -> str:
+        if not self.config["members"]:
+            return "No teammates."
+        lines = [f"Team: {self.config['team_name']}"]
+        for m in self.config["members"]:
+            lines.append(f"  {m['name']} ({m['role']}): {m['status']}")
+        return "\n".join(lines)
+
+    def member_names(self) -> list:
+        return [m["name"] for m in self.config["members"]]
+
+
+TEAM = TeammateManager(TEAM_DIR)
+# ===============================================================================
+
+
 class BackgroundManager:
     """
     run 创建线程，建立任务id映射。
@@ -369,24 +638,24 @@ BG = BackgroundManager()
 
 
 # ======================================================================================
-def safe_path(p: str):
+def _safe_path(p: str):
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"path escapes workspace:{p}")
     return path
 
 
-def run_read(path: str, limit: int = None):
-    text = safe_path(path).read_text()
+def _run_read(path: str, limit: int = None):
+    text = _safe_path(path).read_text()
     lines = text.splitlines()
     if limit and limit < len(lines):
         lines = lines[:limit]
     return "\n".join(lines)[:50000]
 
 
-def run_write(path: str, content: str) -> str:
+def _run_write(path: str, content: str) -> str:
     try:
-        fp = safe_path(path)
+        fp = _safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content)
         return f"Wrote {len(content)} bytes to {path}"
@@ -394,9 +663,9 @@ def run_write(path: str, content: str) -> str:
         return f"Error: {e}"
 
 
-def run_edit(path: str, old_text: str, new_text: str) -> str:
+def _run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
-        fp = safe_path(path)
+        fp = _safe_path(path)
         content = fp.read_text()
         if old_text not in content:
             return f"Error: Text not found in {path}"
@@ -406,7 +675,7 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
-def run_bash(command: str):
+def _run_bash(command: str):
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(item in command for item in dangerous):
         return "Error:Dangerous command blocks"
@@ -452,7 +721,7 @@ def run_subagent(prompt: str):
             tool_name = tool_call.function.name
             args = tool_call.function.arguments
             args = json.loads(args)
-            handler = TOOL_HANDERS.get(tool_name)
+            handler = TOOL_HANDLERS.get(tool_name)
             try:
                 output = handler(**args) if handler else f"Unknow tool: {tool_name}"
             except Exception as e:
@@ -471,29 +740,95 @@ def run_subagent(prompt: str):
     return final_content.strip() if final_content.strip() else "(no output)"
 
 
+TOOL_HANDLERS = {
+    "bash": lambda **kw: _run_bash(kw["command"]),
+    "read_file": lambda **kw: _run_read(kw["path"], kw.get("limit")),
+    "write_file": lambda **kw: _run_write(kw["path"], kw["content"]),
+    "edit_file": lambda **kw: _run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "spawn_teammate": lambda **kw: TEAM.spawn(kw["name"], kw["role"], kw["prompt"]),
+    "list_teammates": lambda **kw: TEAM.list_all(),
+    "send_message": lambda **kw: BUS.send(
+        "lead", kw["to"], kw["content"], kw.get("msg_type", "message")
+    ),
+    "read_inbox": lambda **kw: json.dumps(BUS.read_inbox("lead"), indent=2),
+    "broadcast": lambda **kw: BUS.broadcast("lead", kw["content"], TEAM.member_names()),
+}
 # +++++++++++++++++++++++++++++++工具定义+++++++++++++++++++++++++++++++++++++++++++++++++++++
 
-TOOL_HANDERS = {
-    "bash": lambda **kw: run_bash(kw["command"]),
-    "read_file": lambda **kw: run_read(kw["path"], kw["limit"]),
-    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-    "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
-    "compact": lambda **kw: "Manual compression requested.",
-    "task_create": lambda **kw: TASKS.create(kw["subject"], kw.get("description", "")),
-    "task_update": lambda **kw: TASKS.update(
-        kw["task_id"],
-        kw.get("status"),
-        kw.get("addBlockedBy"),
-        kw.get("removeBlockedBy"),
-    ),
-    "task_list": lambda **kw: TASKS.list_all(),
-    "task_get": lambda **kw: TASKS.get(kw["task_id"]),
-    "background_run": lambda **kw: BG.run(kw["command"]),
-    "check_background": lambda **kw: BG.check(kw.get("task_id")),
-}
 
 CHILD_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "spawn_teammate",
+            "description": "Spawn a persistent teammate that runs in its own thread.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Name of the teammate"},
+                    "role": {"type": "string", "description": "Role of the teammate"},
+                    "prompt": {
+                        "type": "string",
+                        "description": "Initial prompt for the teammate",
+                    },
+                },
+                "required": ["name", "role", "prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_teammates",
+            "description": "List all teammates with name, role, status.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_message",
+            "description": "Send a message to a teammate's inbox.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string", "description": "Recipient teammate name"},
+                    "content": {"type": "string", "description": "Message content"},
+                    "msg_type": {
+                        "type": "string",
+                        "enum": ["TASK", "CHAT", "RESPONSE", "NOTICE"],
+                        "description": "Type of the message",
+                    },
+                },
+                "required": ["to", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_inbox",
+            "description": "Read and drain the lead's inbox.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "broadcast",
+            "description": "Send a message to all teammates.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "Broadcast message content",
+                    }
+                },
+                "required": ["content"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -771,21 +1106,14 @@ PARENT_TOOLS = CHILD_TOOLS + [
 
 def agent_loop(messages: list) -> None:
     while True:
-        notifs = BG.drain_notifications()
-        if notifs and messages:
-            notif_text = "\n".join(
-                f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs
-            )
+        inbox = BUS.read_inbox("lead")
+        if inbox:
             messages.append(
                 {
                     "role": "user",
-                    "content": f"<background-results>\n{notif_text}\n</background-results>",
+                    "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>",
                 }
             )
-        micro_compact(messages)
-        if estimate_tokens(messages) > THRESHOLD:
-            print("auto compact triggered")
-            messages[:] = auto_compact(messages)
 
         response = client.chat.completions.create(
             model=model_id,
@@ -807,25 +1135,13 @@ def agent_loop(messages: list) -> None:
         if tool_calls:
             for tool_call in tool_calls:
                 tool_name = tool_call.function.name
-                if tool_name == "task":
-                    args = json.loads(tool_call.function.arguments)
-                    desc = args.get("description", "")
-                    prompt = args.get("prompt", "")
-                    print(f">task: {desc} : prompt: {prompt}")
-                    output = run_subagent(prompt)
-                elif tool_name == "compact":
-                    manual_compact = True
-                    output = "Compressing"
-                else:
-                    args = json.loads(tool_call.function.arguments)
-                    handler = TOOL_HANDERS.get(tool_name)
-                    print(f"工具调用: {tool_name}")
-                    try:
-                        output = (
-                            handler(**args) if handler else f"Unknow tool :{tool_name}"
-                        )
-                    except Exception as e:
-                        output = f"Error: {e}"
+                args = json.loads(tool_call.function.arguments)
+                handler = TOOL_HANDLERS.get(tool_name)
+                print(f"工具调用: {tool_name}")
+                try:
+                    output = handler(**args) if handler else f"Unknow tool :{tool_name}"
+                except Exception as e:
+                    output = f"Error: {e}"
 
                 print(output[:200])
                 results.append(
@@ -836,14 +1152,6 @@ def agent_loop(messages: list) -> None:
                         "content": output,
                     }
                 )
-                if tool_name == "todo":
-                    used_todo = True
-        # 三轮没有规划任务强制提醒
-        # rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
-        # if rounds_since_todo > 3:
-        #     results.append(
-        #         {"role": "user", "content": "<reminder>Update your todos. </reminder>"}
-        #     )
         messages.extend(results)
         if manual_compact:
             print("[manual compact]")

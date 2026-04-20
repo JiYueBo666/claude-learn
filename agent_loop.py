@@ -29,6 +29,7 @@ THRESHOLD = 50000
 KEEP_RECENT = 3
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 PRESERVE_RESULT_TOOLS = {"read_file"}
+TASKS_DIR = WORKDIR / ".tasks"
 
 
 def estimate_tokens(messages: list):
@@ -185,56 +186,103 @@ class SkillLoader:
 SKILL_LOADER = SkillLoader(SKILLS_DIR)
 
 
-# Layer 1: skill metadata injected into system prompt
-SYSTEM = f"""You are a coding agent at {WORKDIR}.
-Use load_skill to access specialized knowledge before tackling unfamiliar topics.
-
-Skills available:
-{SKILL_LOADER.get_descriptions()}"""
-
 # =======================================================================================
 
 
-class TodoManager:
-    def __init__(self):
-        self.items = []
+class TaskManager:
+    def __init__(self, task_dir: Path):
+        self.dir = task_dir
+        self.dir.mkdir(exist_ok=True)
+        self._next_id = self._max_id() + 1
 
-    def update(self, items):
-        if len(items) > 20:
-            raise ValueError("Max 20 dotos allowed")
-        validated = []
-        in_progress_count = 0
-        for i, item in enumerate(items):
-            text = str(item.get("text", "")).strip()
-            status = str(item.get("status", "")).strip()
-            item_id = str(item.get("id", "")).strip()
-            if not text:
-                raise ValueError(f"Todo {i} text required")
-            if not status:
-                raise ValueError(f"Todo {i} status required")
-            if status == "in_progress":
-                in_progress_count += 1
-            validated.append({"id": item_id, "text": text, "status": status})
-        if in_progress_count > 1:
-            raise ValueError("Only one todo can be in_progress")
-        self.items = validated
-        return self.render()
+    def _max_id(self):
+        ids = [int(f.stem.split("_")[1]) for f in self.dir.glob("*task_*.json")]
+        return max(ids) if ids else 0
 
-    def render(self):
-        if not self.items:
-            return "No todos"
-        lines = []
-        for item in self.items:
-            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}[
-                item["status"]
+    def _load(self, task_id: int):
+        path = self.dir / f"task_{task_id}.json"
+        if not path.exists():
+            raise ValueError(f"Task {task_id} not found")
+        return json.loads(path.read_text())
+
+    def _save(self, task: dict):
+        path = self.dir / f"task_{task['id']}.json"
+        path.write_text(json.dumps(task, indent=2, ensure_ascii=False))
+
+    def create(self, subject: str, description: str = ""):
+        task = {
+            "id": self._next_id,
+            "subject": subject,
+            "description": description,
+            "status": "pending",
+            "blockedBy": [],
+            "owner": "",
+        }
+        self._save(task)
+        self._next_id += 1
+        return json.dumps(task, indent=2, ensure_ascii=False)
+
+    def get(self, task_id: int):
+        return json.dumps(self._load(task_id), indent=2, ensure_ascii=False)
+
+    def update(
+        self,
+        task_id: int,
+        status: str = None,
+        add_blocked_by: list = None,
+        remove_blocked_by: list = None,
+    ):
+        """
+        检查状态，完成则清理依赖
+        """
+        task = self._load(task_id)
+        if status:
+            if status not in ("pending", "in_progress", "completed"):
+                raise ValueError(f"Invalid status: {status}")
+            task["status"] = status
+            if status == "completed":
+                self._clear_dependency(task_id)
+        if add_blocked_by:
+            task["blockedBy"] = list(set(task["blockedBy"] + add_blocked_by))
+        if remove_blocked_by:
+            task["blockedBy"] = [
+                t for t in task["blockedBy"] if t not in remove_blocked_by
             ]
-            lines.append(f"{marker} #{item['id']} {item['text']}")
-        done = sum(1 for t in self.items if t["status"] == "completed")
-        lines.append(f"\n({done}/{len(self.items)} completed)")
+        self._save(task)
+        return json.dumps(task, indent=2, ensure_ascii=False)
+
+    def _clear_dependency(self, completed_id: int):
+        """
+        remove completed id from all other tasks' blockedBy lists
+        """
+        for f in self.dir.glob("*task_*.json"):
+            task = json.loads(f.read_text())
+            if completed_id in task["blockedBy"]:
+                task["blockedBy"].remove(completed_id)
+                self._save(task)
+
+    def list_all(self):
+        tasks = []
+        files = sorted(
+            self.dir.glob("task_*.json"), key=lambda f: int(f.stem.split("_")[1])
+        )
+        for f in files:
+            tasks.append(json.loads(f.read_text()))
+        if not tasks:
+            return "No tasks."
+        lines = []
+        for t in tasks:
+            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(
+                t["status"], "[?]"
+            )
+            blocked = f" (blocked by: {t['blockedBy']})" if t.get("blockedBy") else ""
+            lines.append(f"{marker} #{t['id']}: {t['subject']}{blocked}")
         return "\n".join(lines)
 
 
-TODO = TodoManager()
+TASKS = TaskManager(TASKS_DIR)
+
+# =================================================================================
 
 
 def safe_path(p: str):
@@ -346,12 +394,98 @@ TOOL_HANDERS = {
     "read_file": lambda **kw: run_read(kw["path"], kw["limit"]),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    "todo": lambda **kw: TODO.update(kw["items"]),
     "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
     "compact": lambda **kw: "Manual compression requested.",
+    "task_create": lambda **kw: TASKS.create(kw["subject"], kw.get("description", "")),
+    "task_update": lambda **kw: TASKS.update(
+        kw["task_id"],
+        kw.get("status"),
+        kw.get("addBlockedBy"),
+        kw.get("removeBlockedBy"),
+    ),
+    "task_list": lambda **kw: TASKS.list_all(),
+    "task_get": lambda **kw: TASKS.get(kw["task_id"]),
 }
 
 CHILD_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "task_create",
+            "description": "Create a new task.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subject": {
+                        "type": "string",
+                        "description": "The subject or title of the task",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Detailed description of the task",
+                    },
+                },
+                "required": ["subject"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_update",
+            "description": "Update a task's status or dependencies.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "integer",
+                        "description": "The ID of the task to update",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["pending", "in_progress", "completed"],
+                        "description": "The new status of the task",
+                    },
+                    "addBlockedBy": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "List of task IDs to add as dependencies",
+                    },
+                    "removeBlockedBy": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "List of task IDs to remove from dependencies",
+                    },
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_list",
+            "description": "List all tasks with status summary.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_get",
+            "description": "Get full details of a task by ID.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "integer",
+                        "description": "The ID of the task to retrieve",
+                    }
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {

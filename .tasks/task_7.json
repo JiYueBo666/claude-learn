@@ -1,0 +1,11 @@
+{
+  "id": 7,
+  "subject": "test",
+  "description": "Test the refactoring process end-to-end",
+  "status": "pending",
+  "blockedBy": [
+    5,
+    6
+  ],
+  "owner": ""
+}

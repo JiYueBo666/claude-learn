@@ -4,6 +4,8 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+import threading
+import uuid
 from openai import OpenAI
 from dotenv import load_dotenv
 import yaml
@@ -30,6 +32,8 @@ KEEP_RECENT = 3
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 PRESERVE_RESULT_TOOLS = {"read_file"}
 TASKS_DIR = WORKDIR / ".tasks"
+
+SYSTEM = f"You are a coding agent at {WORKDIR}. Use background_run for long-running commands."
 
 
 def estimate_tokens(messages: list):
@@ -285,6 +289,86 @@ TASKS = TaskManager(TASKS_DIR)
 # =================================================================================
 
 
+class BackgroundManager:
+    """
+    run 创建线程，建立任务id映射。
+    exe 执行命令，写入通知队列
+    check 检查tasks映射，返回所有后台任务
+    """
+
+    def __init__(self):
+        self.tasks = {}  # task id->{status,result,command}
+        self._notification_queue = []  # 已完成的结果
+        self._lock = threading.Lock()
+
+    def run(self, command: str):
+        """
+        start a background thread,return task_id immediately
+        """
+        task_id = str(uuid.uuid4())[:8]
+        self.tasks[task_id] = {"status": "running", "result": None, "command": command}
+        thread = threading.Thread(
+            target=self._execute, args=(task_id, command), daemon=True
+        )
+        thread.start()
+        return f"Background task {task_id} started : {command[:80]}"
+
+    def _execute(self, task_id: str, command: str):
+        """
+        threading target: run subprocess,capture output push to queue
+        """
+        try:
+            r = subprocess.run(
+                command,
+                shell=True,
+                cwd=WORKDIR,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            output = (r.stdout + r.stderr).strip()[:50000]
+            status = "completed"
+        except Exception as e:
+            output = "Error : Time out(300s)"
+            status = "error"
+        self.tasks[task_id]["status"] = status
+        self.tasks[task_id]["result"] = output or "(no output)"
+
+        with self._lock:
+            self._notification_queue.append(
+                {
+                    "task_id": task_id,
+                    "status": status,
+                    "command": command[:80],
+                    "result": (output or "(no output)")[:500],
+                }
+            )
+
+    def check(self, task_id: str):
+        if task_id:
+            t = self.tasks.get(task_id)
+            if not t:
+                return f"Error Unknow task {task_id}"
+            return (
+                f"[{t['status']}] {t['command'][:60]}\n{t.get('result') or '(running)'}"
+            )
+        lines = []
+        for tid, t in self.tasks.items():
+            lines.append(f"{tid}: [{t['status']}] {t['command'][:60]}")
+        return "\n".join(lines) if lines else "No background tasks."
+
+    def drain_notifications(self) -> list:
+        """Return and clear all pending completion notifications."""
+        with self._lock:
+            notifs = list(self._notification_queue)
+            self._notification_queue.clear()
+        return notifs
+
+
+BG = BackgroundManager()
+
+
+# ======================================================================================
 def safe_path(p: str):
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -405,9 +489,44 @@ TOOL_HANDERS = {
     ),
     "task_list": lambda **kw: TASKS.list_all(),
     "task_get": lambda **kw: TASKS.get(kw["task_id"]),
+    "background_run": lambda **kw: BG.run(kw["command"]),
+    "check_background": lambda **kw: BG.check(kw.get("task_id")),
 }
 
 CHILD_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "background_run",
+            "description": "Run command in background thread. Returns task_id immediately.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The command to run in the background",
+                    }
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_background",
+            "description": "Check background task status. Omit task_id to list all.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "The ID of the background task to check (optional, omit to list all tasks)",
+                    }
+                },
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -650,8 +769,19 @@ PARENT_TOOLS = CHILD_TOOLS + [
 ]
 
 
-def agent_loop(messages) -> None:
+def agent_loop(messages: list) -> None:
     while True:
+        notifs = BG.drain_notifications()
+        if notifs and messages:
+            notif_text = "\n".join(
+                f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"<background-results>\n{notif_text}\n</background-results>",
+                }
+            )
         micro_compact(messages)
         if estimate_tokens(messages) > THRESHOLD:
             print("auto compact triggered")

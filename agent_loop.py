@@ -153,6 +153,7 @@ class TeammateManager:
         sys_prompt = (
             f"You are '{name}', role: {role}, at {WORKDIR}. "
             f"Submit plans via plan_approval before major work. "
+            f"Respond to shutdown_request with shutdown_reponse"
         )
         messages = [{"role": "user", "content": prompt}]
         tools = self._teammate_tools()
@@ -182,7 +183,7 @@ class TeammateManager:
 
             # 判断是否停止（不是工具调用就退出）
             if response_msg.tool_calls is None:
-                continue
+                break
             results = []
             # ✅ OpenAI 格式：tool_calls 遍历
             if response_msg.tool_calls:
@@ -228,6 +229,39 @@ class TeammateManager:
             )
         if tool_name == "read_inbox":
             return json.dumps(BUS.read_inbox(sender), indent=2)
+        if tool_name == "shutdown_response":
+            req_id = args["request_id"]
+            approve = args["approve"]
+            with _tracker_lock:
+                if req_id in shutdown_requests:
+                    shutdown_requests[req_id]["approve"] = (
+                        "approved" if approve else "rejected"
+                    )
+            BUS.send(
+                sender=sender,
+                to="lead",
+                content=args.get("reason", ""),
+                msg_type="shutdown_response",
+                extra={"request_id": req_id, "approve": approve},
+            )
+            return f"Shutdown {'approved' if approve else 'rejected'}"
+        if tool_name == "plan_approval":
+            plan_text = args.get("plan", "")
+            req_id = str(uuid.uuid4())[:8]
+            with _tracker_lock:
+                plan_requests[req_id] = {
+                    "from": sender,
+                    "plan": plan_text,
+                    "status": "pending",
+                }
+            BUS.send(
+                sender=sender,
+                to="lead",
+                content=plan_text,
+                msg_type="plan_approval_response",
+                extra={"request_id": req_id, "plan": plan_text},
+            )
+            return f"Plan submitted (request_id={req_id}). Waiting for lead approval."
         return f"Unknown tool: {tool_name}"
 
     def _teammate_tools(self) -> list:
@@ -309,6 +343,37 @@ class TeammateManager:
                     "name": "read_inbox",
                     "description": "Read and drain your inbox.",
                     "parameters": {"type": "object", "properties": {}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "shutdown_response",
+                    "description": "Respond to a shutdown request. Approve to shut down, reject to keep working.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "request_id": {
+                                "type": "string",
+                                "description": "The request ID of the shutdown request.",
+                            },
+                            "approve": {"type": "boolean"},
+                            "reason": {"type": "string"},
+                        },
+                        "required": ["request_id", "approve"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "plan_approval",
+                    "description": "Submit a plan for lead approval. Provide plan text.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"plan": {"type": "string"}},
+                        "required": ["plan"],
+                    },
                 },
             },
         ]
@@ -401,11 +466,75 @@ TOOL_HANDLERS = {
     ),
     "read_inbox": lambda **kw: json.dumps(BUS.read_inbox("lead"), indent=2),
     "broadcast": lambda **kw: BUS.broadcast("lead", kw["content"], TEAM.member_names()),
+    "shutdown_request": lambda **kw: handle_shutdown_request(kw["teammate"]),
+    "shutdown_response": lambda **kw: _check_shutdown_status(kw.get("request_id", "")),
+    "plan_approval": lambda **kw: handle_plan_review(
+        kw["request_id"], kw["approve"], kw.get("feedback", "")
+    ),
 }
 # +++++++++++++++++++++++++++++++工具定义+++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 
 TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "shutdown_request",
+            "description": "Request a teammate to shut down gracefully. Returns a request_id for tracking.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "teammate": {
+                        "type": "string",
+                        "description": "Name or identifier of the teammate to shut down",
+                    }
+                },
+                "required": ["teammate"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "shutdown_response",
+            "description": "Check the status of a shutdown request by request_id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "request_id": {
+                        "type": "string",
+                        "description": "ID of the shutdown request to check status for",
+                    }
+                },
+                "required": ["request_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "plan_approval",
+            "description": "Approve or reject a teammate's plan. Provide request_id + approve + optional feedback.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "request_id": {
+                        "type": "string",
+                        "description": "ID of the plan request to approve or reject",
+                    },
+                    "approve": {
+                        "type": "boolean",
+                        "description": "Whether to approve the plan (true) or reject it (false)",
+                    },
+                    "feedback": {
+                        "type": "string",
+                        "description": "Optional feedback explaining the approval decision",
+                    },
+                },
+                "required": ["request_id", "approve"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -632,6 +761,42 @@ TOOLS = [
 ]
 
 
+def handle_shutdown_request(teammate: str) -> str:
+    req_id = str(uuid.uuid4())[:8]
+    with _tracker_lock:
+        shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
+    BUS.send(
+        sender="lead",
+        to=teammate,
+        content="Please shut down gracefully.",
+        msg_type="shutdown_request",
+        extra={"request_id": req_id},
+    )
+    return f"Shutdown request {req_id} sent to '{teammate}' (status: pending)"
+
+
+def handle_plan_review(request_id: str, approve: bool, feedback: str = ""):
+    with _tracker_lock:
+        req = plan_requests.get(request_id)
+    if not req:
+        return f"Error: Unknown plan request_id '{request_id}"
+    with _tracker_lock:
+        req["status"] = "approved" if approve else "rejected"
+    BUS.send(
+        "lead",
+        req["from"],
+        feedback,
+        "plan_approval_response",
+        {"request_id": request_id, "approve": approve, "feedback": feedback},
+    )
+    return f"Plan {req['status']} for '{req['from']}'"
+
+
+def _check_shutdown_status(request_id: str) -> str:
+    with _tracker_lock:
+        return json.dumps(shutdown_requests.get(request_id, {"error": "not found"}))
+
+
 def agent_loop(messages: list) -> None:
     print()
     while True:
@@ -666,7 +831,6 @@ def agent_loop(messages: list) -> None:
         if finish_reason != "tool_calls":
             return
         results = []
-        manual_compact = False
         tool_calls = response.choices[0].message.tool_calls
         if tool_calls:
             for tool_call in tool_calls:

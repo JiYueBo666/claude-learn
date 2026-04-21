@@ -1,2 +1,2 @@
-{"type": "message", "from": "lead", "content": "Please send a message to Bob introducing yourself and letting him know you're ready to start collaborating on a project.", "timestamp": 1776688652.2273962}
-{"type": "broadcast", "from": "lead", "content": "status update: phase 1 complete", "timestamp": 1776688691.5098183}
+{"type": "broadcast", "from": "lead", "content": "Please prepare for shutdown. Complete any pending work and get ready to terminate your session.", "timestamp": 1776690901.9491515}
+{"type": "broadcast", "from": "lead", "content": "SHUTDOWN REQUEST: alice, please shutdown gracefully now.", "timestamp": 1776690914.9370408}

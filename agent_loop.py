@@ -34,17 +34,19 @@ PRESERVE_RESULT_TOOLS = {"read_file"}
 TASKS_DIR = WORKDIR / ".tasks"
 TEAM_DIR = WORKDIR / ".teams"
 INBOX_DIR = TEAM_DIR / "inbox"
-SYSTEM = (
-    f"You are a team lead at {WORKDIR}. Spawn teammates and communicate via inboxes."
-)
+SYSTEM = f"You are a team lead at {WORKDIR}. Manage teammates with shutdown and plan approval protocols."
 
 VALID_MSG_TYPES = {
     "message",
     "broadcast",
-    "shotdown_request",
+    "shutdown_request",
     "shutdown_response",
     "plan_approval_response",
 }
+
+shutdown_requests = {}
+plan_requests = {}
+_tracker_lock = threading.Lock()
 
 
 def estimate_tokens(messages: list):
@@ -397,10 +399,12 @@ class TeammateManager:
     def _teammate_loop(self, name: str, role: str, prompt: str):
         sys_prompt = (
             f"You are '{name}', role: {role}, at {WORKDIR}. "
-            f"Use send_message to communicate. Complete your task."
+            f"Submit plans via plan_approval before major work. "
+            f"Respond to shutdown_request with shutdown_response."
         )
         messages = [{"role": "user", "content": prompt}]
         tools = self._teammate_tools()  # 你已经是 OpenAI 格式的工具定义
+        shutdown_exit = False
 
         for _ in range(50):
             # 读取消息
@@ -448,14 +452,14 @@ class TeammateManager:
                             "content": str(output),
                         }
                     )
-
+                    if tool_name == "shutdown_response" and tool_args.get("approve"):
+                        shutdown_exit = True
             # 把工具结果加入对话
             messages.extend(results)
-
         # 成员状态改为空闲
         member = self._find_member(name)
-        if member and member["status"] != "shutdown":
-            member["status"] = "idle"
+        if member:
+            member["status"] = "shutdown" if shutdown_exit else "idle"
             self._save_config()
 
     def _exec(self, sender: str, tool_name: str, args: dict) -> str:
@@ -474,71 +478,105 @@ class TeammateManager:
             )
         if tool_name == "read_inbox":
             return json.dumps(BUS.read_inbox(sender), indent=2)
+        if tool_name == "shutdown_response":
+            req_id = args["request_id"]
+            approve = args["approve"]
+            with _tracker_lock:
+                if req_id in shutdown_requests:
+                    (
+                        shutdown_requests[req_id]["status"] == "approved"
+                        if approve
+                        else "rejected"
+                    )
+            BUS.send(
+                sender,
+                "lead",
+                args.get("reason", ""),
+                "shutdown_response",
+                {"request_id": req_id, "approve": approve},
+            )
         return f"Unknown tool: {tool_name}"
 
     def _teammate_tools(self) -> list:
-        # these base tools are unchanged from s02
         return [
             {
-                "name": "bash",
-                "description": "Run a shell command.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {"command": {"type": "string"}},
-                    "required": ["command"],
-                },
-            },
-            {
-                "name": "read_file",
-                "description": "Read file contents.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}},
-                    "required": ["path"],
-                },
-            },
-            {
-                "name": "write_file",
-                "description": "Write content to file.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "content": {"type": "string"},
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "description": "Run a shell command.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
                     },
-                    "required": ["path", "content"],
                 },
             },
             {
-                "name": "edit_file",
-                "description": "Replace exact text in file.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "old_text": {"type": "string"},
-                        "new_text": {"type": "string"},
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read file contents.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
                     },
-                    "required": ["path", "old_text", "new_text"],
                 },
             },
             {
-                "name": "send_message",
-                "description": "Send message to a teammate.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "to": {"type": "string"},
-                        "content": {"type": "string"},
-                        "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)},
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "Write content to file.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"},
+                        },
+                        "required": ["path", "content"],
                     },
-                    "required": ["to", "content"],
                 },
             },
             {
-                "name": "read_inbox",
-                "description": "Read and drain your inbox.",
-                "input_schema": {"type": "object", "properties": {}},
+                "type": "function",
+                "function": {
+                    "name": "edit_file",
+                    "description": "Replace exact text in file.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "old_text": {"type": "string"},
+                            "new_text": {"type": "string"},
+                        },
+                        "required": ["path", "old_text", "new_text"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "send_message",
+                    "description": "Send message to a teammate.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "to": {"type": "string"},
+                            "content": {"type": "string"},
+                            "msg_type": {"type": "string", "enum": VALID_MSG_TYPES},
+                        },
+                        "required": ["to", "content"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_inbox",
+                    "description": "Read and drain your inbox.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
             },
         ]
 
@@ -740,6 +778,42 @@ def run_subagent(prompt: str):
     return final_content.strip() if final_content.strip() else "(no output)"
 
 
+def handle_shutdown_request(teammate: str):
+    req_id = str(uuid.uuid4())[:8]
+    with _tracker_lock:
+        shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
+    BUS.send(
+        "lead",
+        teammate,
+        "Please shut down gracefully.",
+        "shutdown_request",
+        {"request_id": req_id},
+    )
+    return f"Shutdown request {req_id} sent to '{teammate}' (status: pending)"
+
+
+def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
+    with _tracker_lock:
+        req = plan_requests.get(request_id)
+    if not req:
+        return f"Error: Unknown plan request_id '{request_id}'"
+    with _tracker_lock:
+        req["status"] = "approved" if approve else "rejected"
+    BUS.send(
+        "lead",
+        req["from"],
+        feedback,
+        "plan_approval_response",
+        {"request_id": request_id, "approve": approve, "feedback": feedback},
+    )
+    return f"Plan {req['status']} for '{req['from']}'"
+
+
+def _check_shutdown_status(request_id: str) -> str:
+    with _tracker_lock:
+        return json.dumps(shutdown_requests.get(request_id, {"error": "not found"}))
+
+
 TOOL_HANDLERS = {
     "bash": lambda **kw: _run_bash(kw["command"]),
     "read_file": lambda **kw: _run_read(kw["path"], kw.get("limit")),
@@ -752,11 +826,55 @@ TOOL_HANDLERS = {
     ),
     "read_inbox": lambda **kw: json.dumps(BUS.read_inbox("lead"), indent=2),
     "broadcast": lambda **kw: BUS.broadcast("lead", kw["content"], TEAM.member_names()),
+    "shutdown_response": lambda **kw: _check_shutdown_status(kw.get("request_id", "")),
+    "plan_approval": lambda **kw: handle_plan_review(
+        kw["request_id"], kw["approve"], kw.get("feedback", "")
+    ),
 }
 # +++++++++++++++++++++++++++++++工具定义+++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 
 CHILD_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "shutdown_request",
+            "description": "Request a teammate to shut down gracefully. Returns a request_id for tracking.",
+            "parameters": {
+                "type": "object",
+                "properties": {"teammate": {"type": "string"}},
+                "required": ["teammate"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "shutdown_response",
+            "description": "Check the status of a shutdown request by request_id.",
+            "parameters": {
+                "type": "object",
+                "properties": {"request_id": {"type": "string"}},
+                "required": ["request_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "plan_approval",
+            "description": "Approve or reject a teammate's plan. Provide request_id + approve + optional feedback.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "request_id": {"type": "string"},
+                    "approve": {"type": "boolean"},
+                    "feedback": {"type": "string"},
+                },
+                "required": ["request_id", "approve"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {

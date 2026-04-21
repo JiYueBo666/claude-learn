@@ -1,2 +1,1 @@
-{"type": "broadcast", "from": "lead", "content": "Please prepare for shutdown. Complete any pending work and get ready to terminate your session.", "timestamp": 1776690901.9491515}
-{"type": "broadcast", "from": "lead", "content": "SHUTDOWN REQUEST: alice, please shutdown gracefully now.", "timestamp": 1776690914.9370408}
+{"type": "message", "from": "lead", "content": "I've spawned Bob as your tester teammate. Please send Bob a message introducing yourself as the coder and proposing to start working on a project together. Let him know you're ready to write code that he can test.", "timestamp": 1776743554.6340516}

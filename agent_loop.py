@@ -49,259 +49,6 @@ plan_requests = {}
 _tracker_lock = threading.Lock()
 
 
-def estimate_tokens(messages: list):
-    return len(str(messages)) // 4
-
-
-def micro_compact(messages: list):
-    """
-    OpenAI 格式对话消息精简：
-    自动压缩旧的 tool call 结果，只保留最近 KEEP_RECENT 条完整内容
-    兼容 OpenAI Chat Completions tools / function calling 格式
-    """
-    # 1. 收集所有 tool_result（OpenAI  role=tool 的消息）
-    tool_results = []
-    for msg_idx, msg in enumerate(messages):
-        # OpenAI 官方：工具返回用 role="tool"
-        if msg.get("role") == "tool":
-            tool_results.append((msg_idx, msg))
-
-    # 如果工具结果太少，不精简
-    if len(tool_results) < KEEP_RECENT:
-        return messages
-
-    # 2. 建立 tool_call_id -> function name 映射（从 assistant 调用记录）
-    tool_name_map = {}
-    for msg in messages:
-        if msg.get("role") == "assistant":
-            tool_calls = msg.get("tool_calls", [])
-            if not tool_calls:
-                continue
-            for call in tool_calls:
-                tool_id = call.get("id")
-                tool_name = call.get("function", {}).get("name")
-                if tool_id and tool_name:
-                    tool_name_map[tool_id] = tool_name
-
-    # 3. 只保留最近 KEEP_RECENT 条，更早的需要精简
-    to_clear = tool_results[:-KEEP_RECENT]
-
-    # 4. 精简旧的工具结果
-    for msg_idx, result_msg in to_clear:
-        content = result_msg.get("content", "")
-        tool_call_id = result_msg.get("tool_call_id", "")
-
-        # 过滤：短内容不精简
-        if not isinstance(content, str) or len(content) < 100:
-            continue
-
-        # 获取工具名
-        tool_name = tool_name_map.get(tool_call_id, "unknown_tool")
-
-        # 白名单工具不精简
-        if tool_name in PRESERVE_RESULT_TOOLS:
-            continue
-
-        # 替换为精简提示（OpenAI 格式直接改 content 即可）
-        result_msg["content"] = f"[Previous result: {tool_name} called]"
-
-    return messages
-
-
-def auto_compact(messages: list):
-    TRANSCRIPT_DIR.mkdir(exist_ok=True)
-    transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
-    # 历史写入文件
-    with open(transcript_path, "w", encoding="utf-8") as f:
-        for msg in messages:
-            f.write(json.dumps(msg, ensure_ascii=False, default=str) + "\n")
-    print(f"[transcript saved: {transcript_path}]")
-
-    conversation_text = json.dumps(messages, ensure_ascii=False, default=str)[-80000:]
-    response = client.chat.completions.create(
-        model=model_id,
-        messages=[
-            {
-                "role": "user",
-                "content": "Summarize this conversation for continuity. Include:\n"
-                "1) What was accomplished\n"
-                "2) Current state\n"
-                "3) Key decisions made\n"
-                "Be concise but keep critical details.\n\n"
-                f"Conversation:\n{conversation_text}",
-            }
-        ],
-        max_tokens=2000,
-        temperature=0.1,  # 让总结更稳定
-    )
-    summary = response.choices[0].message.content.strip()
-    if not summary:
-        summary = "No summary generated."
-
-    # ========== 5. 返回 OpenAI 格式的单条压缩消息 ==========
-    return [
-        {
-            "role": "user",
-            "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}",
-        }
-    ]
-
-
-# ================================
-class SkillLoader:
-    def __init__(self, skill_dir: Path):
-        self.skill_dir = skill_dir
-        self.skills = {}
-        self._load_all()
-
-    def _load_all(self):
-        if not self.skill_dir.exists():
-            return
-        for f in sorted(self.skill_dir.rglob("SKILL.md")):
-            text = f.read_text()
-            meta, body = self._parse_frontmatter(text)
-            name = meta.get("name", f.parent.name)
-            self.skills[name] = {"meta": meta, "body": body, "path": str(f)}
-
-    def _parse_frontmatter(self, text):
-        match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
-
-        if not match:
-            return {}, text
-
-        try:
-            meta = yaml.safe_load(match.group(1)) or {}
-        except yaml.YAMLError:
-            meta = {}
-
-        return meta, match.group(2).strip()
-
-    def get_descriptions(self):
-        """
-        short description for the system prompt
-        """
-        if not self.skills:
-            return "(no skills available)"
-        lines = []
-        for name, skill in self.skills.items():
-            desc = skill["meta"].get("description", "No description")
-            tags = skill["meta"].get("tags", "")
-            line = f"  - {name}: {desc}"
-            if tags:
-                line += f" [{tags}]"
-            lines.append(line)
-        return "\n".join(lines)
-
-    def get_content(self, name: str) -> str:
-        """Layer 2: full skill body returned in tool_result."""
-        skill = self.skills.get(name)
-        if not skill:
-            return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
-        return f"<skill name=\"{name}\">\n{skill['body']}\n</skill>"
-
-
-SKILL_LOADER = SkillLoader(SKILLS_DIR)
-
-
-# =======================================================================================
-
-
-class TaskManager:
-    def __init__(self, task_dir: Path):
-        self.dir = task_dir
-        self.dir.mkdir(exist_ok=True)
-        self._next_id = self._max_id() + 1
-
-    def _max_id(self):
-        ids = [int(f.stem.split("_")[1]) for f in self.dir.glob("*task_*.json")]
-        return max(ids) if ids else 0
-
-    def _load(self, task_id: int):
-        path = self.dir / f"task_{task_id}.json"
-        if not path.exists():
-            raise ValueError(f"Task {task_id} not found")
-        return json.loads(path.read_text())
-
-    def _save(self, task: dict):
-        path = self.dir / f"task_{task['id']}.json"
-        path.write_text(json.dumps(task, indent=2, ensure_ascii=False))
-
-    def create(self, subject: str, description: str = ""):
-        task = {
-            "id": self._next_id,
-            "subject": subject,
-            "description": description,
-            "status": "pending",
-            "blockedBy": [],
-            "owner": "",
-        }
-        self._save(task)
-        self._next_id += 1
-        return json.dumps(task, indent=2, ensure_ascii=False)
-
-    def get(self, task_id: int):
-        return json.dumps(self._load(task_id), indent=2, ensure_ascii=False)
-
-    def update(
-        self,
-        task_id: int,
-        status: str = None,
-        add_blocked_by: list = None,
-        remove_blocked_by: list = None,
-    ):
-        """
-        检查状态，完成则清理依赖
-        """
-        task = self._load(task_id)
-        if status:
-            if status not in ("pending", "in_progress", "completed"):
-                raise ValueError(f"Invalid status: {status}")
-            task["status"] = status
-            if status == "completed":
-                self._clear_dependency(task_id)
-        if add_blocked_by:
-            task["blockedBy"] = list(set(task["blockedBy"] + add_blocked_by))
-        if remove_blocked_by:
-            task["blockedBy"] = [
-                t for t in task["blockedBy"] if t not in remove_blocked_by
-            ]
-        self._save(task)
-        return json.dumps(task, indent=2, ensure_ascii=False)
-
-    def _clear_dependency(self, completed_id: int):
-        """
-        remove completed id from all other tasks' blockedBy lists
-        """
-        for f in self.dir.glob("*task_*.json"):
-            task = json.loads(f.read_text())
-            if completed_id in task["blockedBy"]:
-                task["blockedBy"].remove(completed_id)
-                self._save(task)
-
-    def list_all(self):
-        tasks = []
-        files = sorted(
-            self.dir.glob("task_*.json"), key=lambda f: int(f.stem.split("_")[1])
-        )
-        for f in files:
-            tasks.append(json.loads(f.read_text()))
-        if not tasks:
-            return "No tasks."
-        lines = []
-        for t in tasks:
-            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(
-                t["status"], "[?]"
-            )
-            blocked = f" (blocked by: {t['blockedBy']})" if t.get("blockedBy") else ""
-            lines.append(f"{marker} #{t['id']}: {t['subject']}{blocked}")
-        return "\n".join(lines)
-
-
-TASKS = TaskManager(TASKS_DIR)
-
-# =================================================================================
-
-
 class MessageBus:
     def __init__(self, inbox_dir: Path):
         self.dir = inbox_dir
@@ -328,6 +75,9 @@ class MessageBus:
         inbox_path = self.dir / f"{to}.jsonl"
         with open(inbox_path, "a") as f:
             f.write(json.dumps(msg) + "\n")
+
+        # response
+        print(f"{sender} -> {to}: {content} ({msg_type}")
         return f"Sent {msg_type} to {to}"
 
     def read_inbox(self, name: str) -> list:
@@ -339,6 +89,7 @@ class MessageBus:
             if line:
                 messages.append(json.loads(line))
         inbox_path.write_text("")
+        print(f"{name} is reading inbox,there are {len(messages)} messages")
         return messages
 
     def broadcast(self, sender: str, content: str, teammates: list) -> str:
@@ -347,6 +98,8 @@ class MessageBus:
             if name != sender:
                 self.send(sender, name, content, "broadcast")
                 count += 1
+        # response
+        print(f"{sender} broadcasted to {count} teammates")
         return f"Broadcast to {count} teammates"
 
 
@@ -400,10 +153,9 @@ class TeammateManager:
         sys_prompt = (
             f"You are '{name}', role: {role}, at {WORKDIR}. "
             f"Submit plans via plan_approval before major work. "
-            f"Respond to shutdown_request with shutdown_response."
         )
         messages = [{"role": "user", "content": prompt}]
-        tools = self._teammate_tools()  # 你已经是 OpenAI 格式的工具定义
+        tools = self._teammate_tools()
         shutdown_exit = False
 
         for _ in range(50):
@@ -413,7 +165,6 @@ class TeammateManager:
                 messages.append(
                     {"role": "user", "content": json.dumps(msg, ensure_ascii=False)}
                 )
-
             try:
                 # ✅ OpenAI 标准格式调用
                 response = client.chat.completions.create(
@@ -431,8 +182,7 @@ class TeammateManager:
 
             # 判断是否停止（不是工具调用就退出）
             if response_msg.tool_calls is None:
-                break
-
+                continue
             results = []
             # ✅ OpenAI 格式：tool_calls 遍历
             if response_msg.tool_calls:
@@ -478,23 +228,6 @@ class TeammateManager:
             )
         if tool_name == "read_inbox":
             return json.dumps(BUS.read_inbox(sender), indent=2)
-        if tool_name == "shutdown_response":
-            req_id = args["request_id"]
-            approve = args["approve"]
-            with _tracker_lock:
-                if req_id in shutdown_requests:
-                    (
-                        shutdown_requests[req_id]["status"] == "approved"
-                        if approve
-                        else "rejected"
-                    )
-            BUS.send(
-                sender,
-                "lead",
-                args.get("reason", ""),
-                "shutdown_response",
-                {"request_id": req_id, "approve": approve},
-            )
         return f"Unknown tool: {tool_name}"
 
     def _teammate_tools(self) -> list:
@@ -596,86 +329,6 @@ TEAM = TeammateManager(TEAM_DIR)
 # ===============================================================================
 
 
-class BackgroundManager:
-    """
-    run 创建线程，建立任务id映射。
-    exe 执行命令，写入通知队列
-    check 检查tasks映射，返回所有后台任务
-    """
-
-    def __init__(self):
-        self.tasks = {}  # task id->{status,result,command}
-        self._notification_queue = []  # 已完成的结果
-        self._lock = threading.Lock()
-
-    def run(self, command: str):
-        """
-        start a background thread,return task_id immediately
-        """
-        task_id = str(uuid.uuid4())[:8]
-        self.tasks[task_id] = {"status": "running", "result": None, "command": command}
-        thread = threading.Thread(
-            target=self._execute, args=(task_id, command), daemon=True
-        )
-        thread.start()
-        return f"Background task {task_id} started : {command[:80]}"
-
-    def _execute(self, task_id: str, command: str):
-        """
-        threading target: run subprocess,capture output push to queue
-        """
-        try:
-            r = subprocess.run(
-                command,
-                shell=True,
-                cwd=WORKDIR,
-                capture_output=True,
-                text=True,
-                timeout=300,
-            )
-            output = (r.stdout + r.stderr).strip()[:50000]
-            status = "completed"
-        except Exception as e:
-            output = "Error : Time out(300s)"
-            status = "error"
-        self.tasks[task_id]["status"] = status
-        self.tasks[task_id]["result"] = output or "(no output)"
-
-        with self._lock:
-            self._notification_queue.append(
-                {
-                    "task_id": task_id,
-                    "status": status,
-                    "command": command[:80],
-                    "result": (output or "(no output)")[:500],
-                }
-            )
-
-    def check(self, task_id: str):
-        if task_id:
-            t = self.tasks.get(task_id)
-            if not t:
-                return f"Error Unknow task {task_id}"
-            return (
-                f"[{t['status']}] {t['command'][:60]}\n{t.get('result') or '(running)'}"
-            )
-        lines = []
-        for tid, t in self.tasks.items():
-            lines.append(f"{tid}: [{t['status']}] {t['command'][:60]}")
-        return "\n".join(lines) if lines else "No background tasks."
-
-    def drain_notifications(self) -> list:
-        """Return and clear all pending completion notifications."""
-        with self._lock:
-            notifs = list(self._notification_queue)
-            self._notification_queue.clear()
-        return notifs
-
-
-BG = BackgroundManager()
-
-
-# ======================================================================================
 def _safe_path(p: str):
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -736,84 +389,6 @@ def _run_bash(command: str):
     return output[:50000] if output else "(no output)"
 
 
-def run_subagent(prompt: str):
-    sub_messages = [{"role": "user", "content": prompt}]
-    for _ in range(30):
-        response = client.chat.completions.create(
-            model=model_id,
-            messages=sub_messages,
-            tool_choice="auto",
-            tools=CHILD_TOOLS,
-            max_tokens=8000,
-        )
-
-        sub_messages.append(
-            {"role": "assistant", "content": response.choices[0].message.content}
-        )
-
-        if response.choices[0].finish_reason != "stop":
-            break
-        results = []
-        tool_calls = response.choices[0].message.tool_calls
-        for tool_call in tool_calls:
-            tool_name = tool_call.function.name
-            args = tool_call.function.arguments
-            args = json.loads(args)
-            handler = TOOL_HANDLERS.get(tool_name)
-            try:
-                output = handler(**args) if handler else f"Unknow tool: {tool_name}"
-            except Exception as e:
-                output = f"Error: {e}"
-            results.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "name": tool_name,
-                    "content": output,
-                }
-            )
-        sub_messages.extend(results)
-    final_content = response.choices[0].message.content
-
-    return final_content.strip() if final_content.strip() else "(no output)"
-
-
-def handle_shutdown_request(teammate: str):
-    req_id = str(uuid.uuid4())[:8]
-    with _tracker_lock:
-        shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
-    BUS.send(
-        "lead",
-        teammate,
-        "Please shut down gracefully.",
-        "shutdown_request",
-        {"request_id": req_id},
-    )
-    return f"Shutdown request {req_id} sent to '{teammate}' (status: pending)"
-
-
-def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
-    with _tracker_lock:
-        req = plan_requests.get(request_id)
-    if not req:
-        return f"Error: Unknown plan request_id '{request_id}'"
-    with _tracker_lock:
-        req["status"] = "approved" if approve else "rejected"
-    BUS.send(
-        "lead",
-        req["from"],
-        feedback,
-        "plan_approval_response",
-        {"request_id": request_id, "approve": approve, "feedback": feedback},
-    )
-    return f"Plan {req['status']} for '{req['from']}'"
-
-
-def _check_shutdown_status(request_id: str) -> str:
-    with _tracker_lock:
-        return json.dumps(shutdown_requests.get(request_id, {"error": "not found"}))
-
-
 TOOL_HANDLERS = {
     "bash": lambda **kw: _run_bash(kw["command"]),
     "read_file": lambda **kw: _run_read(kw["path"], kw.get("limit")),
@@ -826,15 +401,11 @@ TOOL_HANDLERS = {
     ),
     "read_inbox": lambda **kw: json.dumps(BUS.read_inbox("lead"), indent=2),
     "broadcast": lambda **kw: BUS.broadcast("lead", kw["content"], TEAM.member_names()),
-    "shutdown_response": lambda **kw: _check_shutdown_status(kw.get("request_id", "")),
-    "plan_approval": lambda **kw: handle_plan_review(
-        kw["request_id"], kw["approve"], kw.get("feedback", "")
-    ),
 }
 # +++++++++++++++++++++++++++++++工具定义+++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 
-CHILD_TOOLS = [
+TOOLS = [
     {
         "type": "function",
         "function": {
@@ -914,7 +485,13 @@ CHILD_TOOLS = [
                     "content": {"type": "string", "description": "Message content"},
                     "msg_type": {
                         "type": "string",
-                        "enum": ["TASK", "CHAT", "RESPONSE", "NOTICE"],
+                        "enum": [
+                            "message",
+                            "broadcast",
+                            "shutdown_request",
+                            "shutdown_response",
+                            "plan_approval_response",
+                        ],
                         "description": "Type of the message",
                     },
                 },
@@ -944,148 +521,6 @@ CHILD_TOOLS = [
                     }
                 },
                 "required": ["content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "background_run",
-            "description": "Run command in background thread. Returns task_id immediately.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The command to run in the background",
-                    }
-                },
-                "required": ["command"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "check_background",
-            "description": "Check background task status. Omit task_id to list all.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task_id": {
-                        "type": "string",
-                        "description": "The ID of the background task to check (optional, omit to list all tasks)",
-                    }
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "task_create",
-            "description": "Create a new task.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "subject": {
-                        "type": "string",
-                        "description": "The subject or title of the task",
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Detailed description of the task",
-                    },
-                },
-                "required": ["subject"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "task_update",
-            "description": "Update a task's status or dependencies.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task_id": {
-                        "type": "integer",
-                        "description": "The ID of the task to update",
-                    },
-                    "status": {
-                        "type": "string",
-                        "enum": ["pending", "in_progress", "completed"],
-                        "description": "The new status of the task",
-                    },
-                    "addBlockedBy": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "List of task IDs to add as dependencies",
-                    },
-                    "removeBlockedBy": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "List of task IDs to remove from dependencies",
-                    },
-                },
-                "required": ["task_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "task_list",
-            "description": "List all tasks with status summary.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "task_get",
-            "description": "Get full details of a task by ID.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task_id": {
-                        "type": "integer",
-                        "description": "The ID of the task to retrieve",
-                    }
-                },
-                "required": ["task_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "compact",
-            "description": "Trigger manual conversation compression.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "focus": {
-                        "type": "string",
-                        "description": "What content or information to preserve in the summary",
-                    }
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "load_skill",
-            "description": "Load specialized knowledge by name.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Skill name to load"}
-                },
-                "required": ["name"],
             },
         },
     },
@@ -1196,33 +631,9 @@ CHILD_TOOLS = [
     },
 ]
 
-# -- Parent tools: base tools + task dispatcher --
-PARENT_TOOLS = CHILD_TOOLS + [
-    {
-        "type": "function",
-        "function": {
-            "name": "task",
-            "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "prompt": {
-                        "type": "string",
-                        "description": "The main prompt/instruction for the subagent to execute",
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Short description of the task",
-                    },
-                },
-                "required": ["prompt"],
-            },
-        },
-    }
-]
-
 
 def agent_loop(messages: list) -> None:
+    print()
     while True:
         inbox = BUS.read_inbox("lead")
         if inbox:
@@ -1232,20 +643,27 @@ def agent_loop(messages: list) -> None:
                     "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>",
                 }
             )
+        else:
+            print("lead inbox is empty")
 
         response = client.chat.completions.create(
             model=model_id,
             messages=messages,
             tool_choice="auto",
-            tools=PARENT_TOOLS,
+            tools=TOOLS,
             max_tokens=8000,
         )
         messages.append(response.choices[0].message.model_dump())
-
-        print(f"> Assistant: {response.choices[0].message.content}")
+        print()
+        if response.choices[0].message.content.strip():
+            print(f"> Assistant: {response.choices[0].message.content}")
+        else:
+            print("Assistant: <empty>")
         print(f"++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
         # 3.从返回内容中，寻找是否参数调用
-        if response.choices[0].finish_reason != "tool_calls":
+        finish_reason = response.choices[0].finish_reason
+        print(f"finish_reason: {finish_reason}")
+        if finish_reason != "tool_calls":
             return
         results = []
         manual_compact = False
@@ -1271,10 +689,6 @@ def agent_loop(messages: list) -> None:
                     }
                 )
         messages.extend(results)
-        if manual_compact:
-            print("[manual compact]")
-            messages[:] = auto_compact(messages)
-            return
 
 
 if __name__ == "__main__":

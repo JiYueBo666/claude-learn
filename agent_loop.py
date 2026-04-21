@@ -667,10 +667,14 @@ def agent_loop(messages) -> None:
         messages.append(response.choices[0].message.model_dump())
 
         print(f"> Assistant: {response.choices[0].message.content}")
-        print(f"++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+        print(f"===========================================")
         # 3.从返回内容中，寻找是否参数调用
-        if response.choices[0].finish_reason != "tool_calls":
+
+        finish_reason = response.choices[0].finish_reason
+        Loger(f"当前的回合条件: {finish_reason}")
+        if finish_reason != "tool_calls":
             return
+
         results = []
         manual_compact = False
         tool_calls = response.choices[0].message.tool_calls

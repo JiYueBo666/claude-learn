@@ -1,0 +1,4 @@
+openai>=1.0.0
+loguru>=0.7.0
+python-dotenv>=1.0.0
+pathlib2>=2.3.0

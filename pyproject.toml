@@ -1,7 +1,32 @@
 [project]
-name = "claude-learn"
+name = "claude-multi-agent"
 version = "0.1.0"
-description = "Add your description here"
+description = "A sophisticated multi-agent AI system for collaborative task management and team coordination"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "openai>=1.0.0",
+    "loguru>=0.7.0", 
+    "python-dotenv>=1.0.0",
+    "pathlib2>=2.3.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+    "mypy>=1.0.0"
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["*"]
+
+[tool.black]
+line-length = 100
+target-version = ['py310']

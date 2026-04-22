@@ -82,7 +82,8 @@ class TodoManager:
             lines.append(f"{m} {item['content']}{suffix}")
         done = sum(1 for t in self.items if t["status"] == "completed")
         lines.append(f"\n({done}/{len(self.items)} completed)")
-        logger.info(f"render todo items:\n{lines}")
+        sep = "\n"
+        logger.info(f"render todo items:{sep.join(lines)}")
         return "\n".join(lines)
 
     def has_open_items(self) -> bool:
@@ -136,7 +137,9 @@ class TaskManager:
         return json.loads(p.read_text())
 
     def _save(self, task: dict):
-        (TASKS_DIR / f"task_{task['id']}.json").write_text(json.dumps(task, indent=2))
+        (TASKS_DIR / f"task_{task['id']}.json").write_text(
+            json.dumps(task, indent=2, ensure_ascii=False),
+        )
 
     def create(self, subject: str, description: str = "") -> str:
         task = {

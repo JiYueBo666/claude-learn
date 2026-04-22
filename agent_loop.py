@@ -429,7 +429,6 @@ def agent_loop(messages: list) -> None:
         # tool calls
         # 3.从返回内容中，寻找是否参数调用
         finish_reason = response.choices[0].finish_reason
-        print(f"finish_reason: {finish_reason}")
         if finish_reason != "tool_calls":
             return
 

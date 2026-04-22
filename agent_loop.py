@@ -34,6 +34,9 @@ PRESERVE_RESULT_TOOLS = {"read_file"}
 TASKS_DIR = WORKDIR / ".tasks"
 TEAM_DIR = WORKDIR / ".teams"
 INBOX_DIR = TEAM_DIR / "inbox"
+
+POLL_INTERVAL = 5
+IDLE_TIMEOUT = 60
 SYSTEM = f"You are a team lead at {WORKDIR}. Manage teammates with shutdown and plan approval protocols."
 
 VALID_MSG_TYPES = {
@@ -47,6 +50,52 @@ VALID_MSG_TYPES = {
 shutdown_requests = {}
 plan_requests = {}
 _tracker_lock = threading.Lock()
+_claim_lock = threading.Lock()
+
+
+def scan_unclaimed_tasks() -> list:
+    TASKS_DIR.mkdir(exist_ok=True)
+    unclaimed = []
+    for f in sorted(TASKS_DIR.glob("task_*.json")):
+        task = json.loads(f.read_text())
+        if (
+            task.get("status") == "pending"
+            and not task.get("owner")
+            and not task.get("blockedBy")
+        ):
+            unclaimed.append(task)
+    return unclaimed
+
+
+def claim_task(task_id: int, owner: str) -> str:
+    with _claim_lock:
+        path = TASKS_DIR / f"task_{task_id}.json"
+        if not path.exists():
+            return f"Error: Task {task_id} not found"
+        task = json.loads(path.read_text())
+        if task.get("owner"):
+            existing_owner = task.get("owner") or "someone else"
+            return f"Error: Task {task_id} has already been claimed by {existing_owner}"
+        if task.get("status") != "pending":
+            status = task.get("status")
+            return f"Error: Task {task_id} cannot be claimed because its status is '{status}'"
+        if task.get("blockedBy"):
+            return f"Error: Task {task_id} is blocked by other task(s) and cannot be claimed yet"
+        task["owner"] = owner
+        task["status"] = "in_progress"
+        path.write_text(json.dumps(task, indent=2))
+    return f"Claimed task #{task_id} for {owner}"
+
+
+# -- Identity re-injection after compression --
+def make_identity_block(name: str, role: str, team_name: str) -> dict:
+    """
+    上下文压缩后，重新身份注入
+    """
+    return {
+        "role": "user",
+        "content": f"<identity>You are '{name}', role: {role}, team: {team_name}. Continue your work.</identity>",
+    }
 
 
 class MessageBus:
@@ -129,6 +178,12 @@ class TeammateManager:
                 return m
         return None
 
+    def _set_status(self, name: str, status: str):
+        member = self._find_member(name=name)
+        if member:
+            member["status"] = status
+            self._save_config()
+
     def spawn(self, name: str, role: str, prompt: str) -> str:
         member = self._find_member(name)
         if member:
@@ -150,22 +205,27 @@ class TeammateManager:
         return f"Spawned '{name}' (role: {role})"
 
     def _teammate_loop(self, name: str, role: str, prompt: str):
+        team_name = self.config["team_name"]
         sys_prompt = (
             f"You are '{name}', role: {role}, at {WORKDIR}. "
             f"Submit plans via plan_approval before major work. "
             f"Respond to shutdown_request with shutdown_reponse"
         )
-        messages = [{"role": "user", "content": prompt}]
+
+        messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": prompt},
+        ]
         tools = self._teammate_tools()
-        shutdown_exit = False
 
         for _ in range(50):
             # 读取消息
             inbox = BUS.read_inbox(name)
             for msg in inbox:
-                messages.append(
-                    {"role": "user", "content": json.dumps(msg, ensure_ascii=False)}
-                )
+                if msg.get("type") == "shutdown_request":
+                    self._set_status(name=name, status="shutdown")
+                    return
+                messages.append({"role": "user", "content": json.dumps(msg)})
             try:
                 # ✅ OpenAI 标准格式调用
                 response = client.chat.completions.create(
@@ -185,16 +245,19 @@ class TeammateManager:
             if response_msg.tool_calls is None:
                 break
             results = []
+            idle_requested = False
             # ✅ OpenAI 格式：tool_calls 遍历
             if response_msg.tool_calls:
                 for tool_call in response_msg.tool_calls:
                     tool_name = tool_call.function.name
                     tool_args = json.loads(tool_call.function.arguments)
-
-                    # 执行工具
-                    output = self._exec(name, tool_name, tool_args)
+                    if tool_name == "idle":
+                        idle_requested = True
+                        output = "Entering idle phase.Will poll for new task"
+                    else:
+                        # 执行工具
+                        output = self._exec(name, tool_name, tool_args)
                     print(f"  [{name}] {tool_name}: {str(output)[:120]}")
-
                     # 组装 tool_result（OpenAI 格式）
                     results.append(
                         {
@@ -203,15 +266,56 @@ class TeammateManager:
                             "content": str(output),
                         }
                     )
-                    if tool_name == "shutdown_response" and tool_args.get("approve"):
-                        shutdown_exit = True
             # 把工具结果加入对话
             messages.extend(results)
-        # 成员状态改为空闲
-        member = self._find_member(name)
-        if member:
-            member["status"] = "shutdown" if shutdown_exit else "idle"
-            self._save_config()
+            if idle_requested:
+                break
+
+            # idle阶段
+        self._set_status(name, "idle")
+        resume = False
+        polls = IDLE_TIMEOUT // max(POLL_INTERVAL, 1)
+        for _ in range(polls):
+            time.sleep(POLL_INTERVAL)
+            inbox = BUS.read_inbox(name=name)
+            if inbox:
+                for msg in inbox:
+                    if msg.get("type") == "shutdown_request":
+                        self._set_status(name, "shutdown")
+                        return
+                    messages.append({"role": "user", "content": json.dumps(msg)})
+                resume = True
+            # 检测空闲任务
+            unclaimed = scan_unclaimed_tasks()
+            if unclaimed:
+                task = unclaimed[0]
+                # 尝试领取任务
+                result = claim_task(task["id"], name)
+                if result.startswith("Error:"):
+                    continue
+                task_prompt = (
+                    f"<auto-claimed>Task #{task['id']}: {task['subject']}\n"
+                    f"{task.get('description', '')}</auto-claimed>"
+                )
+
+                if len(messages) <= 3:
+                    messages.insert(0, make_identity_block(name, role, team_name))
+                    messages.insert(
+                        1, {"role": "assistant", "content": f"I am {name}. Continuing."}
+                    )
+                messages.append({"role": "user", "content": task_prompt})
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": f"Claimed task #{task['id']}. Working on it.",
+                    }
+                )
+                resume = True
+                break
+        if not resume:
+            self._set_status(name, "shutdown")
+            return
+        self._set_status(name, "working")
 
     def _exec(self, sender: str, tool_name: str, args: dict) -> str:
         # these base tools are unchanged from s02
@@ -262,6 +366,8 @@ class TeammateManager:
                 extra={"request_id": req_id, "plan": plan_text},
             )
             return f"Plan submitted (request_id={req_id}). Waiting for lead approval."
+        if tool_name == "claim_task":
+            return claim_task(args["task_id"], sender)
         return f"Unknown tool: {tool_name}"
 
     def _teammate_tools(self) -> list:
@@ -376,6 +482,26 @@ class TeammateManager:
                     },
                 },
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "idle",
+                    "description": "Signal that you have no more work. Enters idle polling phase.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "claim_task",
+                    "description": "Claim a task from the task board by ID",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"task_id": {"type": "integer"}},
+                        "required": ["task_id"],
+                    },
+                },
+            },
         ]
 
     def list_all(self) -> str:
@@ -391,7 +517,119 @@ class TeammateManager:
 
 
 TEAM = TeammateManager(TEAM_DIR)
+
+
 # ===============================================================================
+class TaskManager:
+    def __init__(self, tasks_dir: Path):
+        self.dir = tasks_dir
+        self.dir.mkdir(exist_ok=True)
+        self._next_id = self._max_id() + 1  # 启动时自动计算下一个可用的自增 ID
+
+    def _max_id(self) -> int:
+        """扫描本地硬盘，找出当前最大的任务 ID"""
+        ids = [int(f.stem.split("_")[1]) for f in self.dir.glob("task_*.json")]
+        return max(ids) if ids else 0
+
+    def _load(self, task_id: int) -> dict:
+        """根据 ID 物理读取 JSON 状态机"""
+        path = self.dir / f"task_{task_id}.json"
+        if not path.exists():
+            raise ValueError(f"Task {task_id} not found")
+        return json.loads(path.read_text())
+
+    def _save(self, task: dict):
+        """原子级落地：将任务状态写回硬盘。这里保留了 ensure_ascii=False 防乱码"""
+        path = self.dir / f"task_{task['id']}.json"
+        path.write_text(json.dumps(task, indent=2, ensure_ascii=False))
+
+    def create(self, subject: str, description: str = "") -> str:
+        """创建一个新任务，初始状态为 pending (待办)"""
+        task = {
+            "id": self._next_id,
+            "subject": subject,
+            "description": description,
+            "status": "pending",
+            "blockedBy": [],
+            "owner": "",
+        }
+        self._save(task)
+        self._next_id += 1
+        return json.dumps(task, indent=2, ensure_ascii=False)
+
+    def get(self, task_id: int) -> str:
+        return json.dumps(self._load(task_id), indent=2, ensure_ascii=False)
+
+    def update(
+        self,
+        task_id: int,
+        status: str = None,
+        add_blocked_by: list = None,
+        remove_blocked_by: list = None,
+    ) -> str:
+        """更新任务的核心逻辑"""
+        task = self._load(task_id)
+
+        if status:
+            if status not in ("pending", "in_progress", "completed"):
+                raise ValueError(f"Invalid status: {status}")
+            task["status"] = status
+
+            # 🎯 图联动的魔法：如果大模型把一个任务标为“已完成”，立刻触发全盘的依赖解除！
+            if status == "completed":
+                self._clear_dependency(task_id)
+
+        if add_blocked_by:
+            # 使用 set 去重，防止同一个前置任务被重复添加
+            task["blockedBy"] = list(set(task["blockedBy"] + add_blocked_by))
+        if remove_blocked_by:
+            task["blockedBy"] = [
+                x for x in task["blockedBy"] if x not in remove_blocked_by
+            ]
+
+        self._save(task)
+        return json.dumps(task, indent=2, ensure_ascii=False)
+
+    def _clear_dependency(self, completed_id: int):
+        """
+        依赖解绑器 (Dependency resolution)：
+        遍历硬盘里的每一个任务，如果它们正在等这个刚完成的 completed_id，就把它从阻塞名单里踢掉。
+        """
+        for f in self.dir.glob("task_*.json"):
+            task = json.loads(f.read_text())
+            if completed_id in task.get("blockedBy", []):
+                task["blockedBy"].remove(completed_id)
+                self._save(task)
+
+    def list_all(self) -> str:
+        """
+        生成给大模型看的宏观看板（把底层 JSON 渲染成 Markdown 风格的列表）。
+        """
+        tasks = []
+        files = sorted(
+            self.dir.glob("task_*.json"), key=lambda f: int(f.stem.split("_")[1])
+        )
+        for f in files:
+            tasks.append(json.loads(f.read_text()))
+        if not tasks:
+            return "No tasks."
+
+        lines = []
+        for t in tasks:
+            # 视觉化标识，方便大模型（和人类）一眼看清状态
+            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(
+                t["status"], "[?]"
+            )
+            blocked = f" (blocked by: {t['blockedBy']})" if t.get("blockedBy") else ""
+            lines.append(f"{marker} #{t['id']}: {t['subject']}{blocked}")
+        return "\n".join(lines)
+
+
+# 实例化全局任务管理器
+TASKS = TaskManager(TASKS_DIR)
+
+
+# ================================================================================
 
 
 def _safe_path(p: str):
@@ -471,11 +709,104 @@ TOOL_HANDLERS = {
     "plan_approval": lambda **kw: handle_plan_review(
         kw["request_id"], kw["approve"], kw.get("feedback", "")
     ),
+    "task_create": lambda **kw: TASKS.create(kw["subject"], kw.get("description", "")),
+    "task_update": lambda **kw: TASKS.update(
+        kw["task_id"],
+        kw.get("status"),
+        kw.get("addBlockedBy"),
+        kw.get("removeBlockedBy"),
+    ),
+    "task_list": lambda **kw: TASKS.list_all(),
+    "task_get": lambda **kw: TASKS.get(kw["task_id"]),
+    "idle": lambda **kw: "Lead does not idle.",
+    "claim_task": lambda **kw: claim_task(kw["task_id"], "lead"),
 }
 # +++++++++++++++++++++++++++++++工具定义+++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 
 TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "task_create",
+            "description": "创建一个新任务，初始状态为 pending（待办）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subject": {
+                        "type": "string",
+                        "description": "任务标题/主题（必填）",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "任务详细描述（可选）",
+                    },
+                },
+                "required": ["subject"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_update",
+            "description": "更新任务状态、添加/移除依赖阻塞关系；状态完成时会自动解除依赖",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "integer",
+                        "description": "要更新的任务 ID（必填）",
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "任务状态，只能是 pending / in_progress / completed",
+                        "enum": ["pending", "in_progress", "completed"],
+                    },
+                    "addBlockedBy": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "要添加的依赖任务 ID 列表",
+                    },
+                    "removeBlockedBy": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "要移除的依赖任务 ID 列表",
+                    },
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_get",
+            "description": "根据任务 ID 获取单个任务的完整信息",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "integer",
+                        "description": "要查询的任务 ID（必填）",
+                    }
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_list",
+            "description": "列出所有任务，包含状态、ID、标题、依赖关系",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -758,6 +1089,26 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "idle",
+            "description": "Signal that you have no more work. Enters idle polling phase.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "claim_task",
+            "description": "Claim a task from the task board by ID",
+            "parameters": {
+                "type": "object",
+                "properties": {"task_id": {"type": "integer"}},
+                "required": ["task_id"],
+            },
+        },
+    },
 ]
 
 
@@ -859,11 +1210,29 @@ if __name__ == "__main__":
     history = []
     while True:
         try:
-            query = input("\033[36ms02 >> \033[0m")
+            query = input("\033[36ms11 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+        if query.strip() == "/team":
+            print(TEAM.list_all())
+            continue
+        if query.strip() == "/inbox":
+            print(json.dumps(BUS.read_inbox("lead"), indent=2))
+            continue
+        if query.strip() == "/tasks":
+            TASKS_DIR.mkdir(exist_ok=True)
+            for f in sorted(TASKS_DIR.glob("task_*.json")):
+                t = json.loads(f.read_text())
+                marker = {
+                    "pending": "[ ]",
+                    "in_progress": "[>]",
+                    "completed": "[x]",
+                }.get(t["status"], "[?]")
+                owner = f" @{t['owner']}" if t.get("owner") else ""
+                print(f"  {marker} #{t['id']}: {t['subject']}{owner}")
+            continue
         history.append({"role": "user", "content": query})
         agent_loop(history)
         response_content = history[-1]["content"]

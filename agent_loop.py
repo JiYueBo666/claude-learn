@@ -30,9 +30,7 @@ TOOL_HANDLERS = {
     "compress": lambda **kw: "Compressing...",
     "background_run": lambda **kw: BG.run(kw["command"], kw.get("timeout", 120)),
     "check_background": lambda **kw: BG.check(kw.get("task_id")),
-    "task_create": lambda **kw: TASK_MGR.create(
-        kw["subject"], kw.get("description", "")
-    ),
+    "task_create": lambda **kw: TASK_MGR.create(kw["subject"], kw.get("description", "")),
     "task_get": lambda **kw: TASK_MGR.get(kw["task_id"]),
     "task_update": lambda **kw: TASK_MGR.update(
         kw["task_id"],
@@ -390,9 +388,7 @@ def agent_loop(messages: list) -> None:
         # 后台结束的任务
         notifs = BG.drain()
         if notifs:
-            txt = "\n".join(
-                f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs
-            )
+            txt = "\n".join(f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs)
             messages.append(
                 {
                     "role": "user",
@@ -410,40 +406,104 @@ def agent_loop(messages: list) -> None:
             )
         else:
             logger.info("[system]:lead inbox is empty")
-        # LLM CALL
+        # LLM CALL (Streaming)
         client: OpenAI
         client, model_id = get_ai_client()
-        response = client.chat.completions.create(
+        stream = client.chat.completions.create(
             model=model_id,
             messages=messages,
             tool_choice="auto",
             tools=TOOLS,
             max_tokens=8000,
+            stream=True,
         )
-        messages.append(response.choices[0].message.model_dump())
 
-        if response.choices[0].message.content.strip():
-            logger.info(f"> Assistant: {response.choices[0].message.content.strip()}")
+        # 流式接收并实时输出
+        print("\033[36m> Assistant: \033[0m", end="", flush=True)
+        full_content = ""
+        tool_calls_data = {}
+        finish_reason = None
+
+        for chunk in stream:
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if not delta:
+                continue
+
+            # 处理文本内容
+            if delta.content:
+                print(delta.content, end="", flush=True)
+                full_content += delta.content
+
+            # 处理工具调用 (流式中分块接收)
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in tool_calls_data:
+                        tool_calls_data[idx] = {
+                            "id": tc.id or "",
+                            "name": tc.function.name or "",
+                            "arguments": tc.function.arguments or "",
+                        }
+                    else:
+                        if tc.id:
+                            tool_calls_data[idx]["id"] = tc.id
+                        if tc.function.name:
+                            tool_calls_data[idx]["name"] = tc.function.name
+                        if tc.function.arguments:
+                            tool_calls_data[idx]["arguments"] += tc.function.arguments
+
+            # 记录完成原因
+            if chunk.choices[0].finish_reason:
+                finish_reason = chunk.choices[0].finish_reason
+
+        print()  # 换行
+
+        # 构建完整的消息对象
+        message_data = {
+            "role": "assistant",
+            "content": full_content,
+        }
+
+        # 转换工具调用数据为列表
+        tool_calls = []
+        if tool_calls_data:
+            for idx in sorted(tool_calls_data.keys()):
+                tc = tool_calls_data[idx]
+                tool_calls.append(
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": tc["arguments"],
+                        },
+                    }
+                )
+            message_data["tool_calls"] = tool_calls
+
+        messages.append(message_data)
+
+        # 记录日志
+        if full_content.strip():
+            logger.info(f"> Assistant: {full_content.strip()}")
         else:
             logger.info("Assistant: <empty>")
-        # tool calls
-        # 3.从返回内容中，寻找是否参数调用
-        finish_reason = response.choices[0].finish_reason
-        if finish_reason != "tool_calls":
+
+        # 检查是否有工具调用
+        if finish_reason != "tool_calls" and not tool_calls:
             return
 
         results = []
         used_todo = False
         manual_compress = False
-        tool_calls = response.choices[0].message.tool_calls
         if tool_calls:
             for tool_call in tool_calls:
-                tool_name = tool_call.function.name
+                tool_name = tool_call["function"]["name"]
                 try:
-                    args = json.loads(tool_call.function.arguments)
+                    args = json.loads(tool_call["function"]["arguments"])
                 except Exception as e:
                     logger.error(
-                        f"Error parsing arguments for tool {tool_name}: {e}, arguments: {tool_call.function.arguments}"
+                        f"Error parsing arguments for tool {tool_name}: {e}, arguments: {tool_call['function']['arguments']}"
                     )
                 if tool_name == "compress":
                     manual_compress = True
@@ -463,7 +523,7 @@ def agent_loop(messages: list) -> None:
                 results.append(
                     {
                         "role": "tool",
-                        "tool_call_id": tool_call.id,
+                        "tool_call_id": tool_call["id"],
                         "name": tool_name,
                         "content": output,
                     }
@@ -472,9 +532,7 @@ def agent_loop(messages: list) -> None:
                     used_todo = True
         rounds_without_todo = 0 if used_todo else rounds_without_todo + 1
         if TODO.has_open_items() and rounds_without_todo >= 3:
-            results.append(
-                {"role": "user", "content": "<reminder>Update your todos.</reminder>"}
-            )
+            results.append({"role": "user", "content": "<reminder>Update your todos.</reminder>"})
         messages.extend(results)
         if manual_compress:
             logger.info("[manual compact]")
@@ -487,7 +545,10 @@ if __name__ == "__main__":
     You are a coding agent at {WORKDIR}. Use tools to solve tasks.
     Prefer task_create/task_update/task_list for multi-step work. Use TodoWrite for short checklists.
     Use task for subagent delegation. Use load_skill for specialized knowledge.
-    Only take necessary actions
+    #Principles:
+    1. Only take necessary actions.
+    2.Do not over-optimize or over-encapsulate. 
+    3.Remember the principle that less is more; if it can be solved in 3 steps, do not use 10 steps.
     Skills: {SKILLS.descriptions()}"""
     history = []
     history.append({"role": "system", "content": SYSTEM})

@@ -404,8 +404,6 @@ def agent_loop(messages: list) -> None:
                     "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>",
                 }
             )
-        else:
-            logger.info("[system]:lead inbox is empty")
         # LLM CALL (Streaming)
         client: OpenAI
         client, model_id = get_ai_client()
@@ -485,7 +483,8 @@ def agent_loop(messages: list) -> None:
 
         # 记录日志
         if full_content.strip():
-            logger.info(f"> Assistant: {full_content.strip()}")
+            # logger.info(f"> Assistant: {full_content.strip()}")
+            pass
         else:
             logger.info("Assistant: <empty>")
 
